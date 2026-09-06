@@ -6,6 +6,9 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: target_repo
 
     steps:
       - name: Checkout repository
@@ -48,6 +51,7 @@ jobs:
             yt-dlp==2026.8.19
 
       - name: Download Cloudflare
+        working-directory: target_repo
         shell: bash
         run: |
           set -euo pipefail
@@ -59,6 +63,7 @@ jobs:
           chmod +x cloudflared
 
       - name: Start Telegram Bot
+        working-directory: target_repo
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -107,7 +112,7 @@ jobs:
             echo "MINI_APP_URL=$TUNNEL_URL"
 
             MINI_APP_URL="$TUNNEL_URL" \
-            PYTHONPATH="$GITHUB_WORKSPACE/telegram_userbot" \
+            PYTHONPATH="$GITHUB_WORKSPACE/target_repo/telegram_userbot:$GITHUB_WORKSPACE/target_repo" \
             python -m telegram_userbot.main &
 
             BOT_PID=$!
