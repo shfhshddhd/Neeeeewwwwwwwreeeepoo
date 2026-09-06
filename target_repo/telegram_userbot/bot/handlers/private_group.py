@@ -37,19 +37,18 @@ _COMMAND_RE = re.compile(
 
 COMMAND_HELP = (
     "<b>Private VC commands</b>\n\n"
-    "<code>/join &lt;group&gt;</code> — join an active Voice Chat\n"
-    "<code>/leave</code> — leave the current Voice Chat\n"
-    "<code>/leaveall</code> — leave and clear the current session\n"
-    "<code>/leaveplay</code> — stop playback but stay in the call\n"
+    "<code>/join &lt;group&gt;</code> — join target Voice Chat and connect audio bridge\n"
+    "<code>/leave</code> — leave target Voice Chat and stop audio bridge\n"
+    "<code>/leaveall</code> — leave all Voice Chats and clear sessions\n"
+    "<code>/leaveplay</code> — stop playback in active sessions\n"
     "<code>/leaverecord</code> — stop and send the recording\n"
-    "<code>/level 1-25</code> — set playback gain\n"
-    "<code>/bass 0-15</code> — set bass for the next playback source\n"
+    "<code>/level 1-25</code> — set bridge and playback gain\n"
+    "<code>/bass 0-15</code> — set bass boost level\n"
     "<code>/mute</code> / <code>/unmute</code> — mute controls\n"
     "<code>/startrecord</code> / <code>/stoprecord</code> — recording controls\n"
     "<code>/speedtest</code> — measure the worker connection\n\n"
-    "<i>These controls use your existing hosted Telegram session.\n"
-    "Only the registered owner can use this group.\n"
-    "Main-bot .vcjoin and .play remain available in the private bot chat.</i>"
+    "<i>These controls operate via the registered owner's hosted session.\n"
+    "Authorized group administrators and the owner can use this group.</i>"
 )
 
 
@@ -215,11 +214,27 @@ async def private_group_command(
     mapping = await db.get_private_control_group_by_chat(int(chat.id))
     if mapping is None:
         return
-    if int(mapping.get("owner_user_id", 0)) != user.id:
-        await reply_html(message, "❌ Only the owner of this private VC group can use these controls.")
+    owner_user_id = int(mapping.get("owner_user_id", 0))
+
+    # Real-time authorization check:
+    # 1. Registered owner is always authorized.
+    # 2. Current Telegram administrators / creator of this group are authorized controllers.
+    is_authorized = (user.id == owner_user_id)
+    if not is_authorized:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            status = getattr(member, "status", None)
+            is_authorized = status in {"creator", "administrator"}
+        except Exception:
+            is_authorized = False
+
+    if not is_authorized:
+        await reply_html(message, "❌ Only the owner or group administrators can use these controls.")
         return
 
-    hosted = _hosted_for_user(context, user.id)
+    # All commands must operate via the ORIGINAL OWNER'S existing hosted session.
+    # The administrator is only a controller and does not need a hosted account.
+    hosted = _hosted_for_user(context, owner_user_id)
     if hosted is None:
         await db.deactivate_private_control_group_by_chat(int(chat.id))
         await reply_html(message, "❌ The owner’s hosted session is inactive; this group has been disabled.")
@@ -231,7 +246,7 @@ async def private_group_command(
         return
 
     manager = context.bot_data.get("manager")
-    voice = _voice_manager_for_owner(manager, user.id)
+    voice = _voice_manager_for_owner(manager, owner_user_id)
     if voice is None:
         await reply_html(message, "❌ The owner’s hosted Voice Chat manager is not running.")
         return
@@ -242,29 +257,15 @@ async def private_group_command(
         if command == "join":
             if not args:
                 raise ValueError("Usage: /join <group username or chat ID>")
-            text = await voice.join_target(args)
+            text = await voice.join_bridge(source_chat_id=int(chat.id), target_identifier=args)
         elif command == "leaveall":
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat sessions."
-            else:
-                text = await voice.leave(voice.state.chat_id)
+            text = await voice.leave_all()
         elif command == "leave":
-            if voice.state is None:
-                text = "ℹ️ Not connected to any Voice Chat."
-            else:
-                text = await voice.leave(voice.state.chat_id)
+            text = await voice.leave_bridge(source_chat_id=int(chat.id))
         elif command == "leaveplay":
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat sessions."
-            else:
-                text = await voice.stop(voice.state.chat_id)
+            text = await voice.stop_all_playback()
         elif command in {"leaverecord", "stoprecord"}:
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat session."
-            elif voice.state.recording_path is None:
-                text = "ℹ️ No recording is currently in progress."
-            else:
-                text = await voice.stop_recording(message.chat.id, voice.state.chat_id)
+            text = await voice.stop_record_target(event=chat.id)
         elif command == "level":
             if not args or not args.lstrip("+-").isdigit():
                 text = (
@@ -273,13 +274,7 @@ async def private_group_command(
                 )
             else:
                 value = int(args)
-                if not 1 <= value <= 25:
-                    text = "❌ Level must be between 1 and 25. Example: <code>/level 10</code>"
-                elif voice.state is None:
-                    text = "ℹ️ No active Voice Chat session to adjust level."
-                else:
-                    await voice.change_volume(voice.state.chat_id, value * 20)
-                    text = f"🎚 Level set to {value}/25."
+                text = await voice.set_level(value)
         elif command == "bass":
             if not args or not args.lstrip("+-").isdigit():
                 text = (
@@ -288,27 +283,13 @@ async def private_group_command(
                 )
             else:
                 value = int(args)
-                if not 0 <= value <= 15:
-                    text = "❌ Bass must be between 0 and 15. Example: <code>/bass 5</code>"
-                elif voice.state is None:
-                    text = "ℹ️ No active Voice Chat session to adjust bass."
-                else:
-                    text = await voice.set_bass(voice.state.chat_id, value)
+                text = await voice.set_bass(value)
         elif command == "mute":
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat session."
-            else:
-                text = await voice.mute(voice.state.chat_id)
+            text = await voice.mute_bridge()
         elif command == "unmute":
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat session."
-            else:
-                text = await voice.unmute(voice.state.chat_id)
+            text = await voice.unmute_bridge()
         elif command == "startrecord":
-            if voice.state is None:
-                text = "ℹ️ No active Voice Chat session. Use /join <group> first."
-            else:
-                text = await voice.start_recording(voice.state.chat_id)
+            text = await voice.start_record_target()
         elif command == "speedtest":
             result = await asyncio.to_thread(_speedtest_sync)
             text = (

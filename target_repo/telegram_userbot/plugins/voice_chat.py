@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 from html import escape
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -57,9 +58,36 @@ _SAFE_DEFAULT_VOLUME = 100
 _PLAYBACK_END_GRACE_SECONDS = 1.5
 _LIVE_FRAME_QUEUE_SIZE = 3
 _LIVE_RECEIVE_QUEUE_SIZE = 8
+_BRIDGE_QUEUE_SIZE = 20
+_BRIDGE_DEFAULT_LEVEL = 5
 # NTgCalls AudioSink is fixed to 10 ms PCM frames. At 48 kHz mono, 16-bit
 # little-endian PCM that is 480 samples / 960 bytes per external frame.
 _LIVE_FRAME_BYTES = 480 * 2
+
+
+class BassFilter:
+    """Zero-latency single-pole low-shelf IIR filter for 48 kHz PCM16 audio."""
+
+    def __init__(self, sample_rate: int = 48000, cutoff: float = 120.0):
+        self.sample_rate = sample_rate
+        self.cutoff = cutoff
+        self._prev_low = 0.0
+        dt = 1.0 / sample_rate
+        rc = 1.0 / (2.0 * math.pi * cutoff)
+        self._alpha = dt / (rc + dt)
+
+    def process_samples(self, samples: array, bass: int) -> None:
+        if bass <= 0:
+            return
+        boost = bass * 0.25
+        alpha = self._alpha
+        prev_low = self._prev_low
+        for i in range(len(samples)):
+            x = samples[i]
+            prev_low = prev_low + alpha * (x - prev_low)
+            y = int(round(x + prev_low * boost))
+            samples[i] = max(-32768, min(32767, y))
+        self._prev_low = prev_low
 
 
 @dataclass
@@ -77,6 +105,7 @@ class VoiceState:
     queue: deque[Track] = field(default_factory=deque)
     current: Track | None = None
     volume: int = 100
+    bass: int = 0
     muted: bool = False
     joined_at: float = field(default_factory=time.monotonic)
     recording_path: Path | None = None
@@ -100,6 +129,28 @@ class VoiceState:
     live_sender_task: asyncio.Task | None = None
     receive_subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
     transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class VoiceBridge:
+    """Source VC -> Target VC real-time audio bridge pipeline."""
+
+    source_chat_id: int
+    target_chat_id: int
+    source_state: VoiceState
+    target_state: VoiceState
+    queue: asyncio.Queue[bytes]
+    relay_task: asyncio.Task | None = None
+    active: bool = False
+    volume: int = 100
+    level: int = 5
+    bass: int = 0
+    muted: bool = False
+    started_at: float = field(default_factory=time.monotonic)
+    relayed_frames: int = 0
+    relayed_bytes: int = 0
+    last_frame_at: float | None = None
+    bass_filter: BassFilter = field(default_factory=BassFilter)
 
 
 def _safe_title(value: str) -> str:
@@ -218,9 +269,18 @@ class VoiceChatManager:
         self.client = client
         self.calls = PyTgCalls(client)
         self.state: VoiceState | None = None
+        self.sessions: dict[int, VoiceState] = {}
+        self.bridge: VoiceBridge | None = None
         self._started = False
         self._tasks: set[asyncio.Task] = set()
         self._temp_dir = Path(tempfile.mkdtemp(prefix="telegram-userbot-vc-"))
+
+    def get_state(self, chat_id: int | None = None) -> VoiceState | None:
+        if chat_id is None:
+            return self.state
+        if self.state is not None and self.state.chat_id == chat_id:
+            return self.state
+        return self.sessions.get(chat_id)
 
     async def start(self) -> None:
         if self._started:
@@ -238,105 +298,111 @@ class VoiceChatManager:
         async def on_update(_, update):
             if isinstance(update, StreamFrames):
                 update_chat_id = getattr(update, "chat_id", None)
-                state = self.state
-                chat_match = (
-                    state is not None
-                    and state.chat_id == update_chat_id
-                )
+                state = self.get_state(update_chat_id)
+                chat_match = state is not None
                 direction = str(
                     getattr(update.direction, "name", update.direction)
                 ).upper()
                 device = str(
                     getattr(update.device, "name", update.device)
                 ).upper()
-                if chat_match:
-                    logger.info(
-                        "[VOICE_AI_DEBUG] PYTG_CALLS_UPDATE_RECEIVED "
-                        "type=StreamFrames chat_id=%s direction=%s device=%s "
-                        "frame_count=%d CHAT_MATCH=%s.",
-                        update_chat_id,
-                        direction,
-                        device,
-                        len(update.frames),
-                        chat_match,
-                    )
-                if not (chat_match and direction == "INCOMING" and device == "SPEAKER"):
+                if not (direction == "INCOMING" and device == "SPEAKER"):
                     return
-                for frame in update.frames:
-                    payload = (
-                        getattr(
-                            frame,
-                            "frame",
-                            getattr(frame, "data", b""),
-                        )
-                        or b""
-                    )
-                    frame_info = getattr(frame, "info", None)
-                    frame_timestamp = getattr(
-                        frame_info,
-                        "capture_time",
-                        None,
-                    )
-                    voice_ai_active = (
-                        getattr(self, "_voice_ai_enabled", False)
-                        and getattr(self, "_voice_ai_capture_chat_id", None)
-                        == update_chat_id
-                    )
-                    voice_ai_reached = voice_ai_active and len(payload) > 0
-                    if payload:
-                        for subscriber in tuple(state.receive_subscribers):
-                            if subscriber.full():
-                                with contextlib.suppress(asyncio.QueueEmpty):
-                                    subscriber.get_nowait()
-                            with contextlib.suppress(asyncio.QueueFull):
-                                subscriber.put_nowait(payload)
-                    if voice_ai_reached:
-                        now = time.monotonic()
-                        self._voice_ai_capture_first_packet_at = (
+
+                # 1. Source -> Target Audio Bridge Relay (PCM16, 48kHz, mono)
+                bridge = self.bridge
+                if (
+                    bridge is not None
+                    and bridge.active
+                    and bridge.source_chat_id == update_chat_id
+                ):
+                    for frame in update.frames:
+                        payload = (
                             getattr(
+                                frame,
+                                "frame",
+                                getattr(frame, "data", b""),
+                            )
+                            or b""
+                        )
+                        if payload:
+                            if bridge.queue.full():
+                                with contextlib.suppress(asyncio.QueueEmpty):
+                                    bridge.queue.get_nowait()
+                            with contextlib.suppress(asyncio.QueueFull):
+                                bridge.queue.put_nowait(payload)
+
+                # 2. Local state subscribers (recording, Mini App live mic)
+                if state is not None and state.receive_subscribers:
+                    for frame in update.frames:
+                        payload = (
+                            getattr(
+                                frame,
+                                "frame",
+                                getattr(frame, "data", b""),
+                            )
+                            or b""
+                        )
+                        if payload:
+                            for subscriber in tuple(state.receive_subscribers):
+                                if subscriber.full():
+                                    with contextlib.suppress(asyncio.QueueEmpty):
+                                        subscriber.get_nowait()
+                                with contextlib.suppress(asyncio.QueueFull):
+                                    subscriber.put_nowait(payload)
+
+                # 3. Voice AI Capture & Debug
+                voice_ai_active = (
+                    getattr(self, "_voice_ai_enabled", False)
+                    and getattr(self, "_voice_ai_capture_chat_id", None)
+                    == update_chat_id
+                )
+                if voice_ai_active:
+                    for frame in update.frames:
+                        payload = (
+                            getattr(
+                                frame,
+                                "frame",
+                                getattr(frame, "data", b""),
+                            )
+                            or b""
+                        )
+                        if payload:
+                            now = time.monotonic()
+                            self._voice_ai_capture_first_packet_at = (
+                                getattr(
+                                    self,
+                                    "_voice_ai_capture_first_packet_at",
+                                    None,
+                                )
+                                or now
+                            )
+                            self._voice_ai_capture_last_packet_at = now
+                            self._voice_ai_capture_packet_count = (
+                                getattr(
+                                    self,
+                                    "_voice_ai_capture_packet_count",
+                                    0,
+                                )
+                                + 1
+                            )
+                            self._voice_ai_capture_packet_bytes = (
+                                getattr(
+                                    self,
+                                    "_voice_ai_capture_packet_bytes",
+                                    0,
+                                )
+                                + len(payload)
+                            )
+                            activity_event = getattr(
                                 self,
-                                "_voice_ai_capture_first_packet_at",
+                                "_voice_ai_capture_activity",
                                 None,
                             )
-                            or now
-                        )
-                        self._voice_ai_capture_last_packet_at = now
-                        self._voice_ai_capture_packet_count = (
-                            getattr(
-                                self,
-                                "_voice_ai_capture_packet_count",
-                                0,
-                            )
-                            + 1
-                        )
-                        self._voice_ai_capture_packet_bytes = (
-                            getattr(
-                                self,
-                                "_voice_ai_capture_packet_bytes",
-                                0,
-                            )
-                            + len(payload)
-                        )
-                        activity_event = getattr(
-                            self,
-                            "_voice_ai_capture_activity",
-                            None,
-                        )
-                        if activity_event is not None:
-                            activity_event.set()
-                    logger.info(
-                        "[VOICE_AI_DEBUG] PACKET_RECEIVED chat_id=%s "
-                        "frame_type=%s frame_bytes=%d timestamp=%s "
-                        "PACKET_BYTES=%d CHAT_MATCH=%s VOICE_AI_REACHED=%s.",
-                        update_chat_id,
-                        type(frame).__name__,
-                        len(payload),
-                        frame_timestamp,
-                        len(payload),
-                        chat_match,
-                        voice_ai_reached,
-                    )
+                            if activity_event is not None:
+                                activity_event.set()
                 return
+
             if not isinstance(update, StreamEnded):
                 return
             if getattr(self, "_voice_ai_enabled", False):
@@ -348,7 +414,7 @@ class VoiceChatManager:
                 )
             if update.stream_type != StreamEnded.Type.AUDIO:
                 return
-            state = self.state
+            state = self.get_state(update.chat_id)
             expected_track = (
                 state.current
                 if state is not None
@@ -374,19 +440,25 @@ class VoiceChatManager:
         self._started = True
 
     def _ensure_single_connection(self, chat_id: int) -> VoiceState:
-        if self.state is not None and self.state.chat_id != chat_id:
+        state = self.get_state(chat_id)
+        if state is not None:
+            return state
+        if self.state is not None and self.state.chat_id != chat_id and self.bridge is None:
             raise RuntimeError(
                 f"I am already connected to `{self.state.chat_id}`. "
                 "Use .vcleave there before joining another voice chat."
             )
+        new_state = VoiceState(chat_id=chat_id, volume=_SAFE_DEFAULT_VOLUME)
+        self.sessions[chat_id] = new_state
         if self.state is None:
-            self.state = VoiceState(chat_id=chat_id, volume=_SAFE_DEFAULT_VOLUME)
-        return self.state
+            self.state = new_state
+        return new_state
 
     def _require_state(self, chat_id: int) -> VoiceState:
-        if self.state is None or self.state.chat_id != chat_id:
+        state = self.get_state(chat_id)
+        if state is None:
             raise RuntimeError("I am not connected to a voice chat here.")
-        return self.state
+        return state
 
     async def _active_group_call(self, entity):
         """Return Telegram's active group-call descriptor, if one exists."""
@@ -453,6 +525,7 @@ class VoiceChatManager:
             chat_title=_safe_title(getattr(entity, "title", None)),
             volume=_SAFE_DEFAULT_VOLUME,
         )
+        self.sessions[chat_id] = self.state
         return (
             f"✅ Connected to <b>{escape(self.state.chat_title)}</b> "
             f"(<code>{chat_id}</code>)."
@@ -804,6 +877,20 @@ class VoiceChatManager:
                 queue.get_nowait()
         with contextlib.suppress(asyncio.QueueFull):
             queue.put_nowait(data)
+
+        # Also relay to active bridge if this chat is the bridge source
+        if (
+            self.bridge is not None
+            and self.bridge.active
+            and self.bridge.source_chat_id == chat_id
+        ):
+            b_queue = self.bridge.queue
+            if b_queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    b_queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                b_queue.put_nowait(data)
+
         return True
 
     def subscribe_receive(self, chat_id: int) -> asyncio.Queue[bytes]:
@@ -814,13 +901,13 @@ class VoiceChatManager:
         return queue
 
     def unsubscribe_receive(self, chat_id: int, queue: asyncio.Queue[bytes]) -> None:
-        state = self.state
-        if state is not None and state.chat_id == chat_id:
+        state = self.get_state(chat_id)
+        if state is not None:
             state.receive_subscribers.discard(queue)
 
     def live_snapshot(self, chat_id: int | None = None) -> dict:
-        state = self.state
-        if state is None or (chat_id is not None and state.chat_id != chat_id):
+        state = self.get_state(chat_id)
+        if state is None:
             return {
                 "active": False,
                 "mic_enabled": False,
@@ -1052,7 +1139,9 @@ class VoiceChatManager:
                 await self.calls.leave_call(chat_id)
         finally:
             self._clear_state(state)
-            self.state = None
+            self.sessions.pop(chat_id, None)
+            if self.state is state or (self.state is not None and self.state.chat_id == chat_id):
+                self.state = None
         return "👋 Left the voice chat and cleared the queue."
 
     async def change_volume(self, chat_id: int, value: int) -> str:
@@ -1217,8 +1306,347 @@ class VoiceChatManager:
         state.live_last_frame_at = None
         state.live_push_active = False
 
+    @staticmethod
+    def _apply_bridge_gain(
+        data: bytes,
+        volume: int,
+        bass: int = 0,
+        bass_filter: BassFilter | None = None,
+    ) -> bytes:
+        """Apply volume multiplier and low-shelf bass boost to PCM16 samples."""
+        if not data:
+            return data
+        usable_length = len(data) - (len(data) % 2)
+        if usable_length <= 0:
+            return b""
+        samples = array("h")
+        samples.frombytes(data[:usable_length])
+
+        if bass > 0 and bass_filter is not None:
+            bass_filter.process_samples(samples, bass)
+
+        if volume == 0:
+            samples = array("h", [0]) * len(samples)
+        elif volume != 100:
+            multiplier = volume / 100.0
+            for index, sample in enumerate(samples):
+                amplified = int(round(sample * multiplier))
+                samples[index] = max(-32768, min(32767, amplified))
+
+        return samples.tobytes()
+
+    async def _send_bridge_frames(self, bridge: VoiceBridge) -> None:
+        """Continuously relay audio frames from source VC to target VC."""
+        queue = bridge.queue
+        chunk_size = _LIVE_FRAME_BYTES
+        try:
+            while bridge.active:
+                data = await queue.get()
+                if not data or not bridge.active:
+                    continue
+                if bridge.muted:
+                    continue
+                transformed = self._apply_bridge_gain(
+                    data,
+                    bridge.volume,
+                    bridge.bass,
+                    bridge.bass_filter,
+                )
+                if not transformed:
+                    continue
+                offset = 0
+                while offset < len(transformed):
+                    chunk = transformed[offset : offset + chunk_size]
+                    if len(chunk) == chunk_size:
+                        await self.calls.send_frame(
+                            bridge.target_chat_id,
+                            Device.MICROPHONE,
+                            chunk,
+                        )
+                        bridge.relayed_frames += 1
+                        bridge.relayed_bytes += len(chunk)
+                    elif len(chunk) > 0 and len(chunk) % 2 == 0:
+                        padded = chunk.ljust(chunk_size, b"\x00")
+                        await self.calls.send_frame(
+                            bridge.target_chat_id,
+                            Device.MICROPHONE,
+                            padded,
+                        )
+                        bridge.relayed_frames += 1
+                        bridge.relayed_bytes += len(padded)
+                    offset += chunk_size
+
+                bridge.last_frame_at = time.monotonic()
+                if bridge.relayed_frames == 1 or bridge.relayed_frames % 200 == 0:
+                    logger.info(
+                        "Relayed bridge frame %s -> %s: frames=%d bytes=%d volume=%d%% bass=%d queue=%d.",
+                        bridge.source_chat_id,
+                        bridge.target_chat_id,
+                        bridge.relayed_frames,
+                        bridge.relayed_bytes,
+                        bridge.volume,
+                        bridge.bass,
+                        queue.qsize(),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Audio bridge relay error forwarding to target %s.",
+                bridge.target_chat_id,
+            )
+
+    async def join_bridge(self, source_chat_id: int, target_identifier: str) -> str:
+        """Connect to source VC and target VC, then establish audio bridge."""
+        if not target_identifier:
+            raise ValueError("Usage: /join <group username or chat ID>")
+        await self.start()
+
+        # 1. Resolve source entity & ensure connected to source VC
+        try:
+            source_entity = await self.client.get_entity(source_chat_id)
+        except Exception as exc:
+            raise RuntimeError(f"Could not resolve private control group: {exc}") from exc
+
+        if await self._active_group_call(source_entity) is None:
+            raise NoActiveGroupCall("No active Voice Chat in this private control group. Start a Voice Chat here first.")
+
+        source_state = self.get_state(source_chat_id)
+        if source_state is None:
+            try:
+                await self.calls.play(source_chat_id, None)
+            except NoActiveGroupCall:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"Could not connect to private group Voice Chat: {exc}") from exc
+            source_state = VoiceState(
+                chat_id=source_chat_id,
+                chat_title=_safe_title(getattr(source_entity, "title", None)),
+                volume=_SAFE_DEFAULT_VOLUME,
+            )
+            self.sessions[source_chat_id] = source_state
+
+        # 2. Resolve target entity
+        target_token = target_identifier.strip()
+        try:
+            target_entity = await self.client.get_entity(
+                int(target_token) if target_token.lstrip("-").isdigit() else target_token.lstrip("@")
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Could not find that target group. Use a group username or numeric chat ID."
+            ) from exc
+
+        if (
+            not isinstance(target_entity, tl_types.Chat)
+            and not (
+                isinstance(target_entity, tl_types.Channel)
+                and bool(getattr(target_entity, "megagroup", False))
+            )
+        ):
+            raise ValueError("The target must be a group or supergroup.")
+
+        if await self._active_group_call(target_entity) is None:
+            raise NoActiveGroupCall("The target group has no active Voice Chat.")
+
+        target_chat_id = int(get_peer_id(target_entity))
+        if target_chat_id == source_chat_id:
+            raise ValueError("Target Voice Chat cannot be the private control group itself.")
+
+        if (
+            self.bridge is not None
+            and self.bridge.active
+            and self.bridge.target_chat_id == target_chat_id
+        ):
+            return (
+                f"✅ Hosted account is already connected to target Voice Chat "
+                f"<b>{escape(self.bridge.target_state.chat_title)}</b> (<code>{target_chat_id}</code>) "
+                f"with active audio bridge."
+            )
+
+        if self.bridge is not None:
+            await self._stop_bridge(self.bridge, leave_target=True)
+
+        # 3. Connect to target VC with external PCM stream for microphone injection
+        stream = MediaStream(
+            ExternalMedia.AUDIO,
+            AudioParameters(bitrate=48000, channels=1),
+            audio_flags=MediaStream.Flags.REQUIRED,
+            video_flags=MediaStream.Flags.IGNORE,
+        )
+        try:
+            await self.calls.play(target_chat_id, stream)
+        except NoActiveGroupCall:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Could not connect to target Voice Chat: {exc}") from exc
+
+        target_state = VoiceState(
+            chat_id=target_chat_id,
+            chat_title=_safe_title(getattr(target_entity, "title", None)),
+            volume=_SAFE_DEFAULT_VOLUME,
+        )
+        self.sessions[target_chat_id] = target_state
+        self.state = target_state
+
+        # 4. Create bounded relay queue (max 20 frames = ~200ms buffer)
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_BRIDGE_QUEUE_SIZE)
+        bridge = VoiceBridge(
+            source_chat_id=source_chat_id,
+            target_chat_id=target_chat_id,
+            source_state=source_state,
+            target_state=target_state,
+            queue=queue,
+            active=True,
+            volume=100,
+            level=_BRIDGE_DEFAULT_LEVEL,
+            bass=0,
+        )
+        bridge.relay_task = asyncio.create_task(
+            self._send_bridge_frames(bridge),
+            name=f"bridge-audio-{source_chat_id}-to-{target_chat_id}",
+        )
+        self._tasks.add(bridge.relay_task)
+        bridge.relay_task.add_done_callback(self._tasks.discard)
+        self.bridge = bridge
+
+        logger.info(
+            "Voice bridge active: source=%s target=%s (%s).",
+            source_chat_id,
+            target_chat_id,
+            target_state.chat_title,
+        )
+        return (
+            f"✅ Hosted account joined target Voice Chat <b>{escape(target_state.chat_title)}</b> "
+            f"(<code>{target_chat_id}</code>) and connected audio bridge from private VC."
+        )
+
+    async def _stop_bridge(self, bridge: VoiceBridge, leave_target: bool = True) -> None:
+        bridge.active = False
+        if bridge.relay_task is not None and bridge.relay_task is not asyncio.current_task():
+            bridge.relay_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bridge.relay_task
+            bridge.relay_task = None
+        while not bridge.queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                bridge.queue.get_nowait()
+        if leave_target:
+            with contextlib.suppress(Exception):
+                await self.calls.leave_call(bridge.target_chat_id)
+            self.sessions.pop(bridge.target_chat_id, None)
+            if self.state is bridge.target_state:
+                self.state = None
+        if self.bridge is bridge:
+            self.bridge = None
+
+    async def leave_bridge(self, source_chat_id: int | None = None) -> str:
+        if self.bridge is None:
+            if self.state is not None:
+                return await self.leave(self.state.chat_id)
+            return "ℹ️ No active target Voice Chat or bridge."
+        target_chat_id = self.bridge.target_chat_id
+        target_title = self.bridge.target_state.chat_title
+        await self._stop_bridge(self.bridge, leave_target=True)
+        return f"👋 Hosted account left target Voice Chat <b>{escape(target_title)}</b> (<code>{target_chat_id}</code>) and stopped audio bridge."
+
+    async def leave_all(self) -> str:
+        if self.bridge is not None:
+            await self._stop_bridge(self.bridge, leave_target=True)
+        for chat_id in list(self.sessions.keys()):
+            with contextlib.suppress(Exception):
+                await self.leave(chat_id)
+        if self.state is not None:
+            with contextlib.suppress(Exception):
+                await self.leave(self.state.chat_id)
+        self.sessions.clear()
+        self.state = None
+        return "👋 Hosted account left all Voice Chats and cleared all sessions."
+
+    async def stop_all_playback(self) -> str:
+        if self.bridge is not None:
+            with contextlib.suppress(Exception):
+                await self.stop(self.bridge.target_chat_id)
+            with contextlib.suppress(Exception):
+                await self.stop(self.bridge.source_chat_id)
+            return "⏹️ Playback stopped in active Voice Chat sessions."
+        if self.state is not None:
+            return await self.stop(self.state.chat_id)
+        return "ℹ️ No active Voice Chat playback to stop."
+
+    async def set_level(self, value: int) -> str:
+        if not 1 <= value <= 25:
+            raise ValueError("Level must be between 1 and 25.")
+        volume = value * 20
+        if self.bridge is not None:
+            self.bridge.level = value
+            self.bridge.volume = volume
+        if self.state is not None:
+            self.state.volume = volume
+        return f"🎚 Level set to {value}/25."
+
+    async def set_bass(self, value: int, chat_id: int | None = None) -> str:
+        if not 0 <= value <= 15:
+            raise ValueError("Bass must be between 0 and 15.")
+        if self.bridge is not None:
+            self.bridge.bass = value
+        state = self.get_state(chat_id)
+        if state is not None:
+            state.bass = value
+        return f"🎚 Bass level set to {value}/15."
+
+    async def mute_bridge(self) -> str:
+        if self.bridge is not None:
+            self.bridge.muted = True
+            with contextlib.suppress(Exception):
+                await self.calls.mute(self.bridge.target_chat_id)
+            return "🔇 Target Voice Chat stream muted."
+        if self.state is not None:
+            return await self.mute(self.state.chat_id)
+        return "ℹ️ No active Voice Chat session to mute."
+
+    async def unmute_bridge(self) -> str:
+        if self.bridge is not None:
+            self.bridge.muted = False
+            with contextlib.suppress(Exception):
+                await self.calls.unmute(self.bridge.target_chat_id)
+            return "🔊 Target Voice Chat stream unmuted."
+        if self.state is not None:
+            return await self.unmute(self.state.chat_id)
+        return "ℹ️ No active Voice Chat session to unmute."
+
+    async def start_record_target(self) -> str:
+        target_id = self.bridge.target_chat_id if self.bridge is not None else (self.state.chat_id if self.state is not None else None)
+        if target_id is None:
+            raise RuntimeError("No active target Voice Chat session. Use /join <group> first.")
+        return await self.start_recording(target_id)
+
+    async def stop_record_target(self, event=None) -> str:
+        target_id = self.bridge.target_chat_id if self.bridge is not None else (self.state.chat_id if self.state is not None else None)
+        if target_id is None:
+            raise RuntimeError("No active Voice Chat session.")
+        state = self._require_state(target_id)
+        if state.recording_path is None:
+            raise RuntimeError("No recording is currently in progress.")
+        return await self._stop_recording(state, target_id, send_file=True, event=event)
+
     async def shutdown(self) -> None:
         await self.stop_ai_voice()
+        if self.bridge is not None:
+            with contextlib.suppress(Exception):
+                await self._stop_bridge(self.bridge, leave_target=True)
+        for chat_id, state in list(self.sessions.items()):
+            state.closing = True
+            if state.recording_path is not None:
+                with contextlib.suppress(Exception):
+                    await self._stop_recording(state, chat_id, send_file=False)
+            with contextlib.suppress(Exception):
+                if state.live_active:
+                    await self.stop_live(chat_id)
+            with contextlib.suppress(Exception):
+                await self.calls.leave_call(chat_id)
+            self._clear_state(state)
+        self.sessions.clear()
         if self.state is not None:
             state = self.state
             state.closing = True
