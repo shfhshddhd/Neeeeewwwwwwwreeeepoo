@@ -32,7 +32,9 @@ def _matches(document: dict, query: dict) -> bool:
                 return False
             if "$in" in expected and actual not in expected["$in"]:
                 return False
-            operators = {"$exists", "$in"}
+            if "$ne" in expected and actual == expected["$ne"]:
+                return False
+            operators = {"$exists", "$in", "$ne"}
             if not set(expected).issubset(operators):
                 if actual != expected:
                     return False
@@ -136,6 +138,31 @@ class _LocalCollection:
             _apply_update(document, update, inserting=inserted)
             self._database._save()
             return _LocalResult(matched_count=1)
+
+    async def update_many(
+        self,
+        query: dict,
+        update: dict,
+        upsert: bool = False,
+    ) -> _LocalResult:
+        async with _local_lock:
+            matched = 0
+            for document in self._documents:
+                if _matches(document, query):
+                    _apply_update(document, update, inserting=False)
+                    matched += 1
+            if matched == 0 and upsert:
+                document = {
+                    key: value
+                    for key, value in query.items()
+                    if not key.startswith("$") and not isinstance(value, dict)
+                }
+                self._documents.append(document)
+                _apply_update(document, update, inserting=True)
+                matched = 1
+            if matched > 0:
+                self._database._save()
+            return _LocalResult(matched_count=matched)
 
     async def delete_one(self, query: dict) -> _LocalResult:
         async with _local_lock:
@@ -273,6 +300,14 @@ async def connect() -> Any:
         await database.ai_memory.create_index(
             [("user_id", 1), ("chat_id", 1), ("participant_id", 1)],
             unique=True,
+        )
+        # Private VC control group mappings
+        await database.private_control_groups.create_index(
+            "private_control_group_id",
+            unique=True,
+        )
+        await database.private_control_groups.create_index(
+            "owner_user_id",
         )
     except Exception as exc:
         client.close()
@@ -891,3 +926,95 @@ async def get_all_active_users() -> list[dict]:
     """Return all users with an active session."""
     cursor = get_db().users.find({"active": True, "session_string": {"$exists": True}})
     return await cursor.to_list(length=None)
+
+
+# ── Private VC control groups ──────────────────────────────────────────────────
+
+async def get_private_control_group_by_chat(chat_id: int) -> dict | None:
+    """Return the active private VC control group mapping for a chat ID, or None."""
+    group_id = int(chat_id)
+    doc = await get_db().private_control_groups.find_one(
+        {"private_control_group_id": group_id, "active": True},
+        {"_id": 0},
+    )
+    return doc
+
+
+async def get_private_control_group_by_owner(owner_user_id: int) -> dict | None:
+    """Return the active private VC control group mapping for an owner, or None."""
+    owner_id = int(owner_user_id)
+    return await get_db().private_control_groups.find_one(
+        {"owner_user_id": owner_id, "active": True},
+        {"_id": 0},
+    )
+
+
+async def save_private_control_group(
+    owner_user_id: int,
+    hosted_account_id: int,
+    private_control_group_id: int,
+    title: str,
+    **kwargs,
+) -> dict:
+    """Persist or update a private VC control group mapping.
+
+    Enforces that an owner can have only one active private control group at a time.
+    """
+    owner_id = int(owner_user_id)
+    hosted_id = int(hosted_account_id)
+    group_id = int(private_control_group_id)
+    clean_title = str(title)
+    now = datetime.now(timezone.utc)
+
+    database = get_db()
+
+    # Safely deactivate any other active control group previously owned by this user
+    await database.private_control_groups.update_many(
+        {
+            "owner_user_id": owner_id,
+            "private_control_group_id": {"$ne": group_id},
+            "active": True,
+        },
+        {"$set": {"active": False, "updated_at": now}},
+    )
+
+    # Upsert the mapping for this private control group
+    await database.private_control_groups.update_one(
+        {"private_control_group_id": group_id},
+        {
+            "$set": {
+                "owner_user_id": owner_id,
+                "hosted_account_id": hosted_id,
+                "title": clean_title,
+                "active": True,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "private_control_group_id": group_id,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+    return {
+        "owner_user_id": owner_id,
+        "hosted_account_id": hosted_id,
+        "private_control_group_id": group_id,
+        "title": clean_title,
+        "active": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def deactivate_private_control_group_by_chat(chat_id: int) -> bool:
+    """Deactivate the private VC control group mapping for a chat ID."""
+    group_id = int(chat_id)
+    now = datetime.now(timezone.utc)
+    result = await get_db().private_control_groups.update_one(
+        {"private_control_group_id": group_id},
+        {"$set": {"active": False, "updated_at": now}},
+    )
+    return getattr(result, "matched_count", 0) > 0
+

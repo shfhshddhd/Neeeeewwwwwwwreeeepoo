@@ -2,7 +2,10 @@
   "name": "telegram-userbot-workflow",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
     "lint": "true",
     "build": "mkdir -p dist && cp index.html dist/ 2>/dev/null || true"
   }
