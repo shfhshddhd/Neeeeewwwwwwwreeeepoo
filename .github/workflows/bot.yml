@@ -112,7 +112,7 @@ jobs:
             echo "MINI_APP_URL=$TUNNEL_URL"
 
             MINI_APP_URL="$TUNNEL_URL" \
-            PYTHONPATH="$GITHUB_WORKSPACE/target_repo/telegram_userbot:$GITHUB_WORKSPACE/target_repo" \
+            PYTHONPATH="${PYTHONPATH:-}:$PWD/telegram_userbot:$PWD:${GITHUB_WORKSPACE:-.}/target_repo/telegram_userbot:${GITHUB_WORKSPACE:-.}/target_repo:${GITHUB_WORKSPACE:-.}/telegram_userbot:${GITHUB_WORKSPACE:-.}" \
             python -m telegram_userbot.main &
 
             BOT_PID=$!

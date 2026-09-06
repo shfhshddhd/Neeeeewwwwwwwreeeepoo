@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "Telegram Userbot Runner",
+  "description": "GitHub Actions runner and diagnostic environment for the Multi-User Telegram Userbot",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

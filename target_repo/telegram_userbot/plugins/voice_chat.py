@@ -77,7 +77,6 @@ class VoiceState:
     queue: deque[Track] = field(default_factory=deque)
     current: Track | None = None
     volume: int = 100
-    bass: int = 0
     muted: bool = False
     joined_at: float = field(default_factory=time.monotonic)
     recording_path: Path | None = None
@@ -101,7 +100,6 @@ class VoiceState:
     live_sender_task: asyncio.Task | None = None
     receive_subscribers: set[asyncio.Queue[bytes]] = field(default_factory=set)
     transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    connection_watchdog: asyncio.Task | None = None
 
 
 def _safe_title(value: str) -> str:
@@ -142,9 +140,7 @@ def _download_url(url: str, output_dir: Path) -> tuple[Path, str]:
     return prepared, title
 
 
-def _create_gain_copy(
-    source: Path, output_dir: Path, volume: int, bass: int = 0
-) -> Path:
+def _create_gain_copy(source: Path, output_dir: Path, volume: int) -> Path:
     """Create a gain-only, temporary stream copy without touching ``source``."""
     playback_path = output_dir / "playback-gain.wav"
     gain = volume / 100
@@ -161,21 +157,7 @@ def _create_gain_copy(
             "0:a:0",
             "-vn",
             "-af",
-            ",".join(
-                [
-                    f"volume={gain:.12g}:precision=float",
-                    *(
-                        [f"bass=g={bass * 2}:f=110:w=0.6"]
-                        if bass > 0
-                        else []
-                    ),
-                    *(
-                        ["alimiter=limit=0.95"]
-                        if bass > 0
-                        else []
-                    ),
-                ]
-            ),
+            f"volume={gain:.12g}:precision=float",
             "-c:a",
             "pcm_f32le",
             str(playback_path),
@@ -471,7 +453,6 @@ class VoiceChatManager:
             chat_title=_safe_title(getattr(entity, "title", None)),
             volume=_SAFE_DEFAULT_VOLUME,
         )
-        self._schedule_connection_watchdog(self.state)
         return (
             f"✅ Connected to <b>{escape(self.state.chat_title)}</b> "
             f"(<code>{chat_id}</code>)."
@@ -591,7 +572,6 @@ class VoiceChatManager:
                 track.path,
                 track.path.parent,
                 state.volume,
-                state.bass,
             )
             playback_duration = await asyncio.to_thread(
                 _probe_duration,
@@ -945,99 +925,6 @@ class VoiceChatManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog
 
-    async def _cancel_connection_watchdog(self, state: VoiceState) -> None:
-        watchdog = state.connection_watchdog
-        state.connection_watchdog = None
-        if watchdog is not None and watchdog is not asyncio.current_task():
-            watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog
-
-    def _schedule_connection_watchdog(self, state: VoiceState) -> None:
-        if state.connection_watchdog is not None:
-            state.connection_watchdog.cancel()
-            state.connection_watchdog = None
-        watchdog = asyncio.create_task(self._connection_watchdog(state))
-        state.connection_watchdog = watchdog
-        self._tasks.add(watchdog)
-        watchdog.add_done_callback(self._tasks.discard)
-
-    async def _connection_watchdog(self, state: VoiceState) -> None:
-        """Periodic health check to detect unexpected disconnects or ended calls."""
-        check_interval = 15.0
-        try:
-            while not state.closing and self.state is state:
-                await asyncio.sleep(check_interval)
-                if state.closing or self.state is not state:
-                    break
-                if not self.client.is_connected():
-                    logger.warning(
-                        "Telethon client disconnected; resetting voice state for %s.",
-                        state.chat_id,
-                    )
-                    await self._handle_remote_disconnect(state)
-                    break
-                try:
-                    entity = await self.client.get_entity(state.chat_id)
-                    call = await self._active_group_call(entity)
-                    if call is None:
-                        logger.warning(
-                            "Telegram group call ended for %s; resetting voice state.",
-                            state.chat_id,
-                        )
-                        await self._handle_remote_disconnect(state)
-                        break
-                except Exception as exc:
-                    err_str = str(exc).lower()
-                    if any(
-                        term in err_str
-                        for term in (
-                            "banned",
-                            "channelprivate",
-                            "kicked",
-                            "chatadminrequired",
-                            "forbidden",
-                            "could not find",
-                        )
-                    ):
-                        logger.warning(
-                            "Userbot lost access to group %s (%s); resetting voice state.",
-                            state.chat_id,
-                            exc,
-                        )
-                        await self._handle_remote_disconnect(state)
-                        break
-                    logger.debug(
-                        "Voice watchdog transient entity check error for %s: %s",
-                        state.chat_id,
-                        exc,
-                    )
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Voice connection watchdog error in %s.", state.chat_id)
-
-    async def _handle_remote_disconnect(self, state: VoiceState) -> None:
-        if state.closing:
-            return
-        state.closing = True
-        await self._cancel_connection_watchdog(state)
-        await self._cancel_playback_watchdog(state)
-        with contextlib.suppress(Exception):
-            await self.stop_ai_voice()
-        if state.recording_path is not None:
-            with contextlib.suppress(Exception):
-                await self._stop_recording(state, state.chat_id, send_file=False)
-        with contextlib.suppress(Exception):
-            if state.live_active:
-                await self.stop_live(state.chat_id)
-        with contextlib.suppress(Exception):
-            await self.calls.leave_call(state.chat_id)
-        self._clear_state(state)
-        if self.state is state:
-            self.state = None
-        logger.info("Voice state cleanly reset after remote disconnect in %s.", state.chat_id)
-
     async def _notify_playback_complete(self, track: Track) -> None:
         if track.on_complete is None:
             return
@@ -1153,14 +1040,11 @@ class VoiceChatManager:
 
     async def leave(self, chat_id: int) -> str:
         state = self._require_state(chat_id)
-        state.closing = True
-        await self._cancel_connection_watchdog(state)
-        await self._cancel_playback_watchdog(state)
         await self.stop_ai_voice()
+        state.closing = True
         try:
             if state.recording_path is not None:
-                with contextlib.suppress(Exception):
-                    await self._stop_recording(state, chat_id, send_file=False)
+                await self._stop_recording(state, chat_id, send_file=False)
             with contextlib.suppress(Exception):
                 if state.live_active:
                     await self.stop_live(chat_id)
@@ -1178,16 +1062,6 @@ class VoiceChatManager:
         state.volume = value
         state.muted = value == 0
         return f"🔊 Playback gain set to {value}%."
-
-    async def set_bass(self, chat_id: int, value: int) -> str:
-        state = self._require_state(chat_id)
-        if not 0 <= value <= 15:
-            raise ValueError("Bass must be between 0 and 15.")
-        state.bass = value
-        return (
-            f"🎚 Bass set to {value}/15. "
-            "It applies to the next playback source."
-        )
 
     async def mute(self, chat_id: int) -> str:
         state = self._require_state(chat_id)
@@ -1209,7 +1083,6 @@ class VoiceChatManager:
             f"Chat: <code>{state.chat_id}</code>",
             f"Connected for: <code>{_format_duration(time.monotonic() - state.joined_at)}</code>",
             f"Volume gain: <code>{state.volume}%</code>{' (muted)' if state.muted else ''}",
-            f"Bass: <code>{state.bass}/15</code>",
             (
                 f"Now playing: <b>{escape(state.current.title)}</b>"
                 if state.current
@@ -1281,20 +1154,18 @@ class VoiceChatManager:
         except Exception:
             logger.exception("Timed voice-chat recording failed in %s.", chat_id)
 
-    async def stop_recording(self, destination, chat_id: int) -> str:
+    async def stop_recording(self, event, chat_id: int) -> str:
         state = self._require_state(chat_id)
         if state.recording_path is None:
             raise RuntimeError("No recording is in progress.")
-        return await self._stop_recording(
-            state, chat_id, send_file=True, destination=destination
-        )
+        return await self._stop_recording(state, chat_id, send_file=True, event=event)
 
     async def _stop_recording(
         self,
         state: VoiceState,
         chat_id: int,
         send_file: bool,
-        destination=None,
+        event=None,
     ) -> str:
         if (
             state.recording_task is not None
@@ -1309,25 +1180,19 @@ class VoiceChatManager:
             return "No recording is in progress."
         with contextlib.suppress(Exception):
             await self.calls.play(chat_id, None)
-        if not send_file:
-            shutil.rmtree(path.parent, ignore_errors=True)
-            return "⏹️ Recording stopped."
-        for _ in range(5):
-            if path.exists() and path.stat().st_size > 0:
-                break
-            await asyncio.sleep(0.2)
-        if not path.exists() or path.stat().st_size == 0:
+        if not path.exists():
             shutil.rmtree(path.parent, ignore_errors=True)
             raise RuntimeError("The recording did not produce an audio file.")
         try:
-            target = destination if destination is not None else chat_id
-            await self.client.send_file(
-                target,
-                path,
-                force_document=True,
-                caption="🎧 Voice chat recording",
-            )
-            return "⏹️ Recording stopped and delivered."
+            if send_file:
+                target = event if event is not None else chat_id
+                await self.client.send_file(
+                    target,
+                    path,
+                    force_document=True,
+                    caption="🎧 Voice chat recording",
+                )
+            return "⏹️ Recording stopped and processed."
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -1343,9 +1208,6 @@ class VoiceChatManager:
         if state.playback_watchdog is not None:
             state.playback_watchdog.cancel()
             state.playback_watchdog = None
-        if state.connection_watchdog is not None:
-            state.connection_watchdog.cancel()
-            state.connection_watchdog = None
         state.live_active = False
         if state.live_sender_task is not None:
             state.live_sender_task.cancel()
@@ -1360,8 +1222,6 @@ class VoiceChatManager:
         if self.state is not None:
             state = self.state
             state.closing = True
-            await self._cancel_connection_watchdog(state)
-            await self._cancel_playback_watchdog(state)
             if state.recording_path is not None:
                 with contextlib.suppress(Exception):
                     await self._stop_recording(state, state.chat_id, send_file=False)

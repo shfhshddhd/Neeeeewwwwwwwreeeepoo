@@ -90,9 +90,6 @@ class _LocalCollection:
     async def create_index(self, *_args, **_kwargs) -> None:
         return None
 
-    async def drop_index(self, *_args, **_kwargs) -> None:
-        return None
-
     async def find_one(self, query: dict, projection: dict | None = None) -> dict | None:
         async with _local_lock:
             document = next((item for item in self._documents if _matches(item, query)), None)
@@ -139,31 +136,6 @@ class _LocalCollection:
             _apply_update(document, update, inserting=inserted)
             self._database._save()
             return _LocalResult(matched_count=1)
-
-    async def update_many(
-        self,
-        query: dict,
-        update: dict,
-        upsert: bool = False,
-    ) -> _LocalResult:
-        async with _local_lock:
-            matched = 0
-            for document in self._documents:
-                if _matches(document, query):
-                    _apply_update(document, update, inserting=False)
-                    matched += 1
-            if matched == 0 and upsert:
-                document = {
-                    key: value
-                    for key, value in query.items()
-                    if not key.startswith("$") and not isinstance(value, dict)
-                }
-                self._documents.append(document)
-                _apply_update(document, update, inserting=True)
-                matched = 1
-            if matched > 0:
-                self._database._save()
-            return _LocalResult(matched_count=matched)
 
     async def delete_one(self, query: dict) -> _LocalResult:
         async with _local_lock:
@@ -302,20 +274,6 @@ async def connect() -> Any:
             [("user_id", 1), ("chat_id", 1), ("participant_id", 1)],
             unique=True,
         )
-        # One active private VC control group can belong to only one owner.
-        await database.private_control_groups.create_index(
-            "private_control_group_id", unique=True
-        )
-        try:
-            await database.private_control_groups.drop_index("owner_user_id_1_active_1")
-        except Exception:
-            pass
-        await database.private_control_groups.create_index(
-            [("owner_user_id", 1)],
-            unique=True,
-            partialFilterExpression={"active": True},
-            name="owner_user_id_active_unique",
-        )
     except Exception as exc:
         client.close()
         _client = None
@@ -365,101 +323,6 @@ async def save_session(user_id: int, session_string: str) -> None:
 async def get_session(user_id: int) -> str | None:
     user = await get_user(user_id)
     return user.get("session_string") if user else None
-
-
-# ── Private VC control groups ─────────────────────────────────────────────────
-async def get_private_control_group(owner_user_id: int) -> dict | None:
-    """Return the active private VC control group owned by a bot user."""
-    return await get_db().private_control_groups.find_one(
-        {"owner_user_id": owner_user_id, "active": True}
-    )
-
-
-async def get_private_control_group_by_chat(chat_id: int) -> dict | None:
-    """Return the active mapping for a Telegram group, if one exists."""
-    return await get_db().private_control_groups.find_one(
-        {"private_control_group_id": chat_id, "active": True}
-    )
-
-
-async def save_private_control_group(
-    *,
-    owner_user_id: int,
-    hosted_account_id: int,
-    private_control_group_id: int,
-    title: str,
-) -> None:
-    """Persist one owner-scoped control-group mapping without session data."""
-    collection = get_db().private_control_groups
-    conflict = await collection.find_one(
-        {"private_control_group_id": private_control_group_id, "active": True}
-    )
-    if conflict is not None and int(conflict.get("owner_user_id", 0)) != owner_user_id:
-        raise ValueError("That group is already linked to another active hosted owner.")
-
-    now = datetime.now(timezone.utc)
-    await collection.update_many(
-        {"owner_user_id": owner_user_id, "active": True},
-        {"$set": {"active": False, "updated_at": now}},
-    )
-
-    try:
-        await collection.update_one(
-            {"private_control_group_id": private_control_group_id},
-            {
-                "$set": {
-                    "owner_user_id": owner_user_id,
-                    "hosted_account_id": hosted_account_id,
-                    "private_control_group_id": private_control_group_id,
-                    "title": title,
-                    "active": True,
-                    "updated_at": now,
-                },
-                "$setOnInsert": {"created_at": now},
-            },
-            upsert=True,
-        )
-    except Exception as exc:
-        err_msg = str(exc).lower()
-        if "duplicate key" in err_msg or "e11000" in err_msg:
-            await collection.update_many(
-                {"owner_user_id": owner_user_id, "active": True},
-                {"$set": {"active": False, "updated_at": now}},
-            )
-            await collection.update_one(
-                {"private_control_group_id": private_control_group_id},
-                {
-                    "$set": {
-                        "owner_user_id": owner_user_id,
-                        "hosted_account_id": hosted_account_id,
-                        "private_control_group_id": private_control_group_id,
-                        "title": title,
-                        "active": True,
-                        "updated_at": now,
-                    },
-                    "$setOnInsert": {"created_at": now},
-                },
-                upsert=True,
-            )
-        else:
-            raise
-
-
-async def deactivate_private_control_group(owner_user_id: int) -> None:
-    """Disable all active control groups owned by a user during /unhost."""
-    collection = get_db().private_control_groups
-    now = datetime.now(timezone.utc)
-    await collection.update_many(
-        {"owner_user_id": owner_user_id, "active": True},
-        {"$set": {"active": False, "updated_at": now}},
-    )
-
-
-async def deactivate_private_control_group_by_chat(chat_id: int) -> None:
-    await get_db().private_control_groups.update_one(
-        {"private_control_group_id": chat_id, "active": True},
-        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}},
-    )
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────

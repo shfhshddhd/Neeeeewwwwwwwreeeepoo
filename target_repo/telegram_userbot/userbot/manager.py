@@ -55,8 +55,7 @@ class UserbotManager:
         await self._start_one(user_id, session_string)
 
     async def remove_session(self, user_id: int) -> None:
-        """Stop the hosted session and deactivate its private VC controls."""
-        await db.deactivate_private_control_group(user_id)
+        """Stop and remove a userbot session."""
         if user_id in self._clients:
             await self._clients[user_id].stop()
             del self._clients[user_id]
