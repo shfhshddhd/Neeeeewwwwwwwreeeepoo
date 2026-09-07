@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from datetime import datetime, timezone
 from html import escape
@@ -14,6 +15,8 @@ from telegram.ext import ConversationHandler, ContextTypes, MessageHandler, filt
 
 import database.mongo as db
 from utils.message_ui import reply_html
+
+logger = logging.getLogger(__name__)
 
 
 def _voice_manager_for_owner(manager, owner_user_id: int):
@@ -211,50 +214,135 @@ async def private_group_command(
     if match is None:
         return
 
-    mapping = await db.get_private_control_group_by_chat(int(chat.id))
-    if mapping is None:
-        return
-    owner_user_id = int(mapping.get("owner_user_id", 0))
-
-    # Real-time authorization check:
-    # 1. Registered owner is always authorized.
-    # 2. Current Telegram administrators / creator of this group are authorized controllers.
-    is_authorized = (user.id == owner_user_id)
-    if not is_authorized:
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
-            status = getattr(member, "status", None)
-            is_authorized = status in {"creator", "administrator"}
-        except Exception:
-            is_authorized = False
-
-    if not is_authorized:
-        await reply_html(message, "❌ Only the owner or group administrators can use these controls.")
-        return
-
-    # All commands must operate via the ORIGINAL OWNER'S existing hosted session.
-    # The administrator is only a controller and does not need a hosted account.
-    hosted = _hosted_for_user(context, owner_user_id)
-    if hosted is None:
-        await db.deactivate_private_control_group_by_chat(int(chat.id))
-        await reply_html(message, "❌ The owner’s hosted session is inactive; this group has been disabled.")
-        return
-    hosted_account_id = int(getattr(hosted, "_own_id", 0) or 0)
-    if hosted_account_id and hosted_account_id != int(mapping.get("hosted_account_id", hosted_account_id)):
-        await db.deactivate_private_control_group_by_chat(int(chat.id))
-        await reply_html(message, "❌ The hosted session identity changed; run setup again.")
-        return
-
-    manager = context.bot_data.get("manager")
-    voice = _voice_manager_for_owner(manager, owner_user_id)
-    if voice is None:
-        await reply_html(message, "❌ The owner’s hosted Voice Chat manager is not running.")
-        return
-
     command = match.group("command").lower()
     args = (match.group("args") or "").strip()
-    logger.info("[VC_CONTROL_COMMAND] Chat %s received command /%s (args=%s)", chat.id, command, args)
+
+    logger.info(
+        "[VC_CONTROL_COMMAND] received chat_id=%s user_id=%s command=%s args=%r",
+        chat.id,
+        user.id,
+        command,
+        args,
+    )
+
     try:
+        mapping = await db.get_private_control_group_by_chat(int(chat.id))
+        logger.info(
+            "[VC_CONTROL_AUTH] chat_id=%s control_group_found=%s",
+            chat.id,
+            mapping is not None,
+        )
+        if mapping is None:
+            logger.info(
+                "[VC_CONTROL_AUTH] chat_id=%s is not a registered private control group",
+                chat.id,
+            )
+            return
+
+        owner_user_id = int(mapping.get("owner_user_id", 0))
+
+        # Real-time authorization check:
+        # 1. Registered owner is always authorized.
+        # 2. Current Telegram administrators / creator of this group are authorized controllers.
+        is_owner = (user.id == owner_user_id)
+        is_admin = False
+        if not is_owner:
+            try:
+                member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+                status = getattr(member, "status", None)
+                is_admin = status in {"creator", "administrator"}
+            except Exception as auth_exc:
+                logger.warning(
+                    "[VC_CONTROL_AUTH] Failed checking chat member admin status: chat_id=%s user_id=%s error=%s",
+                    chat.id,
+                    user.id,
+                    auth_exc,
+                )
+                is_admin = False
+
+        is_authorized = is_owner or is_admin
+        logger.info(
+            "[VC_CONTROL_AUTH] chat_id=%s user_id=%s owner_user_id=%s sender_is_owner=%s sender_is_admin=%s authorized=%s",
+            chat.id,
+            user.id,
+            owner_user_id,
+            is_owner,
+            is_admin,
+            is_authorized,
+        )
+
+        if not is_authorized:
+            logger.warning(
+                "[VC_CONTROL_AUTH] Unauthorized command attempt: chat_id=%s user_id=%s command=%s",
+                chat.id,
+                user.id,
+                command,
+            )
+            await reply_html(message, "❌ Only the owner or group administrators can use these controls.")
+            return
+
+        # All commands must operate via the ORIGINAL OWNER'S existing hosted session.
+        # The administrator is only a controller and does not need a hosted account.
+        hosted = _hosted_for_user(context, owner_user_id)
+        logger.info(
+            "[VC_CONTROL_SESSION] chat_id=%s hosted_session_found=%s hosted_owner_id=%s",
+            chat.id,
+            hosted is not None,
+            owner_user_id,
+        )
+        if hosted is None:
+            logger.warning(
+                "[VC_CONTROL_SESSION] Owner session inactive for owner_user_id=%s chat_id=%s",
+                owner_user_id,
+                chat.id,
+            )
+            await db.deactivate_private_control_group_by_chat(int(chat.id))
+            await reply_html(message, "❌ The owner’s hosted session is inactive; this group has been disabled.")
+            return
+
+        hosted_account_id = int(getattr(hosted, "_own_id", 0) or 0)
+        mapping_hosted_id = int(mapping.get("hosted_account_id", hosted_account_id))
+        identity_match = (not hosted_account_id or hosted_account_id == mapping_hosted_id)
+        logger.info(
+            "[VC_CONTROL_SESSION] hosted_account_id=%s mapping_hosted_id=%s identity_match=%s",
+            hosted_account_id,
+            mapping_hosted_id,
+            identity_match,
+        )
+        if hosted_account_id and hosted_account_id != mapping_hosted_id:
+            logger.warning(
+                "[VC_CONTROL_SESSION] Hosted account identity mismatch for chat_id=%s (current=%s mapped=%s)",
+                chat.id,
+                hosted_account_id,
+                mapping_hosted_id,
+            )
+            await db.deactivate_private_control_group_by_chat(int(chat.id))
+            await reply_html(message, "❌ The hosted session identity changed; run setup again.")
+            return
+
+        manager = context.bot_data.get("manager")
+        voice = _voice_manager_for_owner(manager, owner_user_id)
+        logger.info(
+            "[VC_CONTROL_SESSION] voice_manager_found=%s",
+            voice is not None,
+        )
+        if voice is None:
+            logger.warning(
+                "[VC_CONTROL_SESSION] Voice manager not running for owner_user_id=%s chat_id=%s",
+                owner_user_id,
+                chat.id,
+            )
+            await reply_html(message, "❌ The owner’s hosted Voice Chat manager is not running.")
+            return
+
+        logger.info(
+            "[VC_CONTROL_VC] starting command=%s args=%r chat_id=%s user_id=%s",
+            command,
+            args,
+            chat.id,
+            user.id,
+        )
+
         if command == "join":
             if not args:
                 raise ValueError("Usage: /join <group username or chat ID>")
@@ -309,8 +397,22 @@ async def private_group_command(
             )
         else:
             return
+
+        logger.info(
+            "[VC_CONTROL_VC] command=%s success chat_id=%s user_id=%s",
+            command,
+            chat.id,
+            user.id,
+        )
         await reply_html(message, text)
     except Exception as exc:
+        logger.exception(
+            "[VC_CONTROL_ERROR] command=%s chat_id=%s user_id=%s error=%s",
+            command,
+            chat.id,
+            user.id,
+            exc,
+        )
         await reply_html(message, f"❌ {escape(str(exc))}")
 
 

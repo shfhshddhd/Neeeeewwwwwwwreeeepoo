@@ -6,12 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-import motor.motor_asyncio
+try:
+    import motor.motor_asyncio
+except ImportError:
+    motor = None
 from config import MONGO_URI
 
 logger = logging.getLogger(__name__)
 
-_client: motor.motor_asyncio.AsyncIOMotorClient | None = None
+_client: Any = None
 _db: Any = None
 _local_lock = asyncio.Lock()
 _local_path = Path(__file__).resolve().parents[1] / "DB" / "mongo_fallback.json"
@@ -254,8 +257,8 @@ async def connect() -> Any:
     crashing the whole polling process.
     """
     global _client, _db
-    if not MONGO_URI:
-        logger.warning("MONGO_URI is empty; starting without persistent database.")
+    if not MONGO_URI or motor is None:
+        logger.warning("MONGO_URI is empty or motor is not installed; starting without persistent database.")
         _db = _LocalDatabase(_local_path)
         return _db
 

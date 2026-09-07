@@ -1,3 +1,4 @@
+import logging
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 from bot.handlers.start import start_command, help_command, allcommands_command
 from bot.handlers.host import build_host_handler, unhost_command
@@ -28,6 +29,8 @@ from bot.handlers.private_group import (
     build_private_group_control_handler,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def register_all(app: Application, manager) -> None:
     app.bot_data["manager"] = manager
@@ -54,6 +57,7 @@ def register_all(app: Application, manager) -> None:
     # Private-group setup and controls are isolated from the main-bot chat.
     app.add_handler(build_private_group_setup_handler())
     app.add_handler(build_private_group_control_handler())
+    logger.info("[VC_CONTROL] private control handlers registered")
     # Dot-prefixed Voice Chat controls remain private-chat only.
     app.add_handler(build_voice_chat_handler())
     app.add_handler(CallbackQueryHandler(update_control_callback, pattern=r"^self_update:"))
