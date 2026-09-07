@@ -50,15 +50,18 @@ def _calculate_pcm_level(data: bytes) -> tuple[float, int, bool]:
 
 
 class _LiveStream:
-    def __init__(self, cmd: List[str], name: str):
+    def __init__(self, cmd: List[str], name: str, source_id: Optional[int] = None, target_id: Optional[int] = None):
         self.cmd = cmd
         self.name = name
+        self.source_id = source_id
+        self.target_id = target_id
         self.process: Optional[asyncio.subprocess.Process] = None
         self.subscribers: List[asyncio.Queue] = []
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self.total_chunks: int = 0
         self.total_bytes: int = 0
+        self.non_silent_frames: int = 0
         self.last_non_silent_at: float = 0.0
 
     async def start(self) -> None:
@@ -93,6 +96,7 @@ class _LiveStream:
                 rms, peak, is_non_silent = _calculate_pcm_level(chunk)
                 now = time.monotonic()
                 if is_non_silent:
+                    self.non_silent_frames += 1
                     self.last_non_silent_at = now
 
                 if first_chunk or (now - last_log_time >= 3.0) or (is_non_silent and now - self.last_non_silent_at < 0.1 and now - last_log_time >= 1.0):
@@ -218,11 +222,18 @@ class AudioHTTPBridge:
             self._runner = None
         self._started = False
 
-    async def register_stream(self, key: str, cmd: List[str], name: str) -> str:
+    async def register_stream(
+        self,
+        key: str,
+        cmd: List[str],
+        name: str,
+        source_id: Optional[int] = None,
+        target_id: Optional[int] = None,
+    ) -> str:
         if not self._started:
             await self.start()
         await self.remove_stream(key)
-        stream = _LiveStream(cmd, name)
+        stream = _LiveStream(cmd, name, source_id=source_id, target_id=target_id)
         await stream.start()
         self._streams[key] = stream
         return self.url_for(key)
@@ -272,11 +283,14 @@ class AudioHTTPBridge:
                 if now - last_log >= 5.0:
                     last_log = now
                     logger.info(
-                        "[VC_BRIDGE_TARGET] streaming to target VC: key=%s chunks_sent=%d bytes_sent=%d subscribers=%d",
-                        key,
+                        "[VC_BRIDGE_TARGET] source=%s target=%s stream=%s subscribers=%d chunks_sent=%d bytes_sent=%d non_silent_frames=%d",
+                        stream.source_id or "unknown",
+                        stream.target_id or "unknown",
+                        stream.name,
+                        len(stream.subscribers),
                         chunks_sent,
                         bytes_sent,
-                        len(stream.subscribers),
+                        stream.non_silent_frames,
                     )
         except (ConnectionError, asyncio.CancelledError, Exception):
             pass

@@ -51,6 +51,84 @@ def _prepare_runtime_environment() -> None:
         os.environ["XDG_RUNTIME_DIR"] = runtime_dir
     if uid == 0:
         os.environ["PULSE_ALLOW_ROOT"] = "1"
+    os.environ["PULSE_SINK"] = DEFAULT_SINK_NAME
+    os.environ["PULSE_SOURCE"] = f"{DEFAULT_SINK_NAME}.monitor"
+
+
+async def route_sink_inputs_to_vcrelay(sink_name: str = DEFAULT_SINK_NAME) -> int:
+    """Find active PulseAudio sink-inputs and move them to vcrelay."""
+    if not pulseaudio_available():
+        return 0
+    _, out, err = await _run("pactl", "list", "short", "sink-inputs")
+    if err or not out.strip():
+        return 0
+    moved_count = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            input_id = parts[0]
+            curr_sink = parts[1]
+            if curr_sink != sink_name:
+                _, _, move_err = await _run("pactl", "move-sink-input", input_id, sink_name)
+                if not move_err:
+                    moved_count += 1
+                    logger.info("[VC_BRIDGE_PULSE] Moved sink-input %s from %s to %s", input_id, curr_sink, sink_name)
+    return moved_count
+
+
+async def set_default_pulse_sink_and_source(sink_name: str = DEFAULT_SINK_NAME) -> None:
+    """Set the default PulseAudio sink and source to vcrelay."""
+    if not pulseaudio_available():
+        return
+    await _run("pactl", "set-default-sink", sink_name)
+    await _run("pactl", "set-default-source", f"{sink_name}.monitor")
+    os.environ["PULSE_SINK"] = sink_name
+    os.environ["PULSE_SOURCE"] = f"{sink_name}.monitor"
+
+
+async def log_pulseaudio_diagnostics(sink_name: str = DEFAULT_SINK_NAME) -> dict:
+    """Log structured PulseAudio diagnostics."""
+    if not pulseaudio_available():
+        return {}
+    _, info_out, _ = await _run("pactl", "info")
+    def_sink = "unknown"
+    def_source = "unknown"
+    for line in info_out.splitlines():
+        if line.startswith("Default Sink:"):
+            def_sink = line.split(":", 1)[1].strip()
+        elif line.startswith("Default Source:"):
+            def_source = line.split(":", 1)[1].strip()
+
+    _, sinks_out, _ = await _run("pactl", "list", "short", "sinks")
+    _, sources_out, _ = await _run("pactl", "list", "short", "sources")
+    _, inputs_out, _ = await _run("pactl", "list", "short", "sink-inputs")
+    _, outputs_out, _ = await _run("pactl", "list", "short", "source-outputs")
+
+    vcrelay_sink = sink_name if any(sink_name in line for line in sinks_out.splitlines()) else "none"
+    vcrelay_monitor = f"{sink_name}.monitor" if any(f"{sink_name}.monitor" in line for line in sources_out.splitlines()) else "none"
+
+    diag = {
+        "default_sink": def_sink,
+        "default_source": def_source,
+        "vcrelay_sink": vcrelay_sink,
+        "vcrelay_monitor": vcrelay_monitor,
+        "sinks": sinks_out.replace("\t", " ").strip(),
+        "sources": sources_out.replace("\t", " ").strip(),
+        "sink_inputs": inputs_out.replace("\t", " ").strip(),
+        "source_outputs": outputs_out.replace("\t", " ").strip(),
+    }
+    logger.info(
+        "[VC_BRIDGE_PULSE]\ndefault_sink=%s\ndefault_source=%s\nvcrelay_sink=%s\nvcrelay_monitor=%s\nsinks=%s\nsources=%s\nsink_inputs=%s\nsource_outputs=%s",
+        diag["default_sink"],
+        diag["default_source"],
+        diag["vcrelay_sink"],
+        diag["vcrelay_monitor"],
+        diag["sinks"],
+        diag["sources"],
+        diag["sink_inputs"],
+        diag["source_outputs"],
+    )
+    return diag
 
 
 async def _drain_daemon_stderr(process: asyncio.subprocess.Process) -> None:
@@ -200,6 +278,10 @@ async def ensure_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> str:
     logger.info("[VC_BRIDGE] created sink %s", sink_name)
     logger.info("[VC_BRIDGE] monitor=%s.monitor", sink_name)
     logger.info("[VC_BRIDGE] sink_ready monitor=%s.monitor", sink_name)
+
+    await set_default_pulse_sink_and_source(sink_name)
+    await route_sink_inputs_to_vcrelay(sink_name)
+    await log_pulseaudio_diagnostics(sink_name)
 
     return f"{sink_name}.monitor"
 

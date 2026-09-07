@@ -15,6 +15,83 @@ sys.path.insert(0, str(BASE_DIR))
 import config
 sys.modules["config.config"] = config
 
+try:
+    import telethon
+    from telethon import functions
+    from telethon.tl import types as tl_types
+    from telethon.utils import get_peer_id
+except ImportError:
+    class Chat:
+        pass
+    class Channel:
+        pass
+    mock_telethon = MagicMock()
+    mock_tl = MagicMock()
+    mock_tl_types = MagicMock()
+    mock_tl_types.Chat = Chat
+    mock_tl_types.Channel = Channel
+    mock_tl.types = mock_tl_types
+    mock_telethon.tl = mock_tl
+    sys.modules["telethon"] = mock_telethon
+    sys.modules["telethon.errors"] = mock_telethon
+    sys.modules["telethon.functions"] = mock_telethon
+    sys.modules["telethon.tl"] = mock_tl
+    sys.modules["telethon.tl.types"] = mock_tl_types
+    sys.modules["telethon.utils"] = mock_telethon
+    mock_telethon.utils.get_peer_id = lambda entity: getattr(entity, "id", 0)
+
+try:
+    import aiohttp
+    from aiohttp import web
+except ImportError:
+    import types
+    class MockRunner:
+        async def setup(self):
+            pass
+        async def cleanup(self):
+            pass
+    class MockSite:
+        async def start(self):
+            pass
+        async def stop(self):
+            pass
+    mock_aiohttp = types.ModuleType("aiohttp")
+    mock_web = types.ModuleType("web")
+    mock_web.AppRunner = lambda *a, **kw: MockRunner()
+    mock_web.TCPSite = lambda *a, **kw: MockSite()
+    mock_web.Application = MagicMock
+    mock_web.Request = MagicMock
+    mock_web.StreamResponse = MagicMock
+    mock_web.HTTPNotFound = Exception
+    mock_aiohttp.web = mock_web
+    sys.modules["aiohttp"] = mock_aiohttp
+    sys.modules["aiohttp.web"] = mock_web
+
+try:
+    import pytgcalls
+    from pytgcalls.exceptions import NoActiveGroupCall
+    from pytgcalls.types import AudioQuality, MediaStream
+except ImportError:
+    class NoActiveGroupCall(Exception):
+        pass
+    class MediaStream:
+        def __init__(self, media_path=None, *args, **kwargs):
+            self._media_path = media_path
+        Flags = MagicMock()
+    class AudioQuality:
+        STUDIO = "STUDIO"
+    mock_pytgcalls = MagicMock()
+    mock_exceptions = MagicMock()
+    mock_exceptions.NoActiveGroupCall = NoActiveGroupCall
+    mock_types = MagicMock()
+    mock_types.MediaStream = MediaStream
+    mock_types.AudioQuality = AudioQuality
+    sys.modules["pytgcalls"] = mock_pytgcalls
+    sys.modules["pytgcalls.exceptions"] = mock_exceptions
+    sys.modules["pytgcalls.pytgcalls_session"] = mock_pytgcalls
+    sys.modules["pytgcalls.types"] = mock_types
+    sys.modules["pytgcalls.types.raw"] = mock_pytgcalls
+
 import database.mongo as db
 from telegram_userbot.vc_bridge import (
     AudioHTTPBridge,
@@ -26,7 +103,6 @@ from telegram_userbot.vc_bridge import (
     teardown_virtual_sink,
 )
 from plugins.voice_chat import VoiceChatManager, VoiceBridge, VoiceState
-from pytgcalls.types import AudioQuality, MediaStream
 
 
 class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
@@ -93,7 +169,9 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         vm.calls.unmute = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
-        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
+        with patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock) as mock_sink, \
+             patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
+            mock_sink.return_value = "vcrelay.monitor"
             mock_peer_id.side_effect = lambda ent: -1001111 if ent == source_chat else -1002222
             res = await vm.join_bridge(source_chat_id=-1001111, target_identifier="targetgroup")
 

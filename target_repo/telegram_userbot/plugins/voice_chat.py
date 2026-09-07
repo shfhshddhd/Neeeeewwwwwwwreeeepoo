@@ -46,7 +46,10 @@ from telegram_userbot.vc_bridge import (
     build_capture_command_stdout,
     build_silence_command_stdout,
     ensure_virtual_sink,
+    log_pulseaudio_diagnostics,
     pulseaudio_available,
+    route_sink_inputs_to_vcrelay,
+    set_default_pulse_sink_and_source,
     teardown_virtual_sink,
 )
 
@@ -165,6 +168,7 @@ class VoiceBridge:
     capture_key: str = ""
     silence_url: str = ""
     capture_url: str = ""
+    pulse_watchdog_task: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -1550,6 +1554,8 @@ class VoiceChatManager:
             silence_key,
             silence_cmd,
             name=f"silence-{source_chat_id}",
+            source_id=source_chat_id,
+            target_id=target_chat_id,
         )
         logger.info("[VC_JOIN_TRACE] Step 4a: Silence URL=%s (took %.2fs)", silence_url, time.monotonic() - t0)
 
@@ -1599,6 +1605,8 @@ class VoiceChatManager:
             capture_key,
             capture_cmd,
             name=f"capture-{target_chat_id}",
+            source_id=source_chat_id,
+            target_id=target_chat_id,
         )
         logger.info("[VC_JOIN_TRACE] Step 5a: Capture URL=%s (took %.2fs)", capture_url, time.monotonic() - t0)
 
@@ -1668,6 +1676,14 @@ class VoiceChatManager:
         )
         self._tasks.add(bridge.relay_task)
         bridge.relay_task.add_done_callback(self._tasks.discard)
+
+        bridge.pulse_watchdog_task = asyncio.create_task(
+            self._pulse_routing_watchdog(bridge, sink_name),
+            name=f"pulse-routing-{source_chat_id}",
+        )
+        self._tasks.add(bridge.pulse_watchdog_task)
+        bridge.pulse_watchdog_task.add_done_callback(self._tasks.discard)
+
         self.bridge = bridge
 
         total_elapsed = time.monotonic() - t_start
@@ -1698,6 +1714,19 @@ class VoiceChatManager:
                 name=f"capture-{bridge.target_chat_id}",
             )
 
+    async def _pulse_routing_watchdog(self, bridge: VoiceBridge, sink_name: str) -> None:
+        """Periodically route any active PulseAudio sink-inputs to vcrelay."""
+        try:
+            while bridge.active:
+                await asyncio.sleep(2.0)
+                if not bridge.active:
+                    break
+                await route_sink_inputs_to_vcrelay(sink_name)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Error in _pulse_routing_watchdog: %s", exc)
+
     async def _stop_bridge(self, bridge: VoiceBridge, leave_target: bool = True) -> None:
         logger.info(
             "[VC_LEAVE_TRACE] _stop_bridge start: source=%s target=%s leave_target=%s",
@@ -1706,6 +1735,11 @@ class VoiceChatManager:
             leave_target,
         )
         bridge.active = False
+        if bridge.pulse_watchdog_task is not None and bridge.pulse_watchdog_task is not asyncio.current_task():
+            bridge.pulse_watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(bridge.pulse_watchdog_task, timeout=2.0)
+            bridge.pulse_watchdog_task = None
         if bridge.relay_task is not None and bridge.relay_task is not asyncio.current_task():
             bridge.relay_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
