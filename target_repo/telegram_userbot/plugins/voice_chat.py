@@ -168,6 +168,17 @@ class VoiceBridge:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+class VoiceBridgeNoActiveGroupCall(NoActiveGroupCall, RuntimeError):
+    """Exception raised when a required group voice call is not active during bridging."""
+
+    def __init__(self, message: str = "No active Voice Chat found."):
+        self.message = message
+        super(NoActiveGroupCall, self).__init__(message)
+
+    def __str__(self) -> str:
+        return self.message
+
+
 def _safe_title(value: str) -> str:
     value = " ".join((value or "").split()).strip()
     return value[:160] or "Voice chat audio"
@@ -1426,7 +1437,9 @@ class VoiceChatManager:
             raise RuntimeError(f"Could not resolve private control group: {exc}") from exc
 
         if await self._active_group_call(source_entity) is None:
-            raise NoActiveGroupCall("No active Voice Chat in this private control group. Start a Voice Chat here first.")
+            raise VoiceBridgeNoActiveGroupCall(
+                "No active Voice Chat in this private control group. Start a Voice Chat here first."
+            )
 
         # 2. Resolve target entity
         target_token = target_identifier.strip()
@@ -1449,7 +1462,9 @@ class VoiceChatManager:
             raise ValueError("The target must be a group or supergroup.")
 
         if await self._active_group_call(target_entity) is None:
-            raise NoActiveGroupCall("The target group has no active Voice Chat.")
+            raise VoiceBridgeNoActiveGroupCall(
+                f"The target group ({_safe_title(getattr(target_entity, 'title', None)) or target_token}) has no active Voice Chat."
+            )
 
         target_chat_id = int(get_peer_id(target_entity))
         if target_chat_id == source_chat_id:
@@ -1494,9 +1509,11 @@ class VoiceChatManager:
         )
         try:
             await self.calls.play(source_chat_id, source_stream)
-        except NoActiveGroupCall:
+        except NoActiveGroupCall as exc:
             await self.audio_bridge.remove_stream(silence_key)
-            raise
+            raise VoiceBridgeNoActiveGroupCall(
+                "No active Voice Chat in this private control group. Start a Voice Chat here first."
+            ) from exc
         except Exception as exc:
             await self.audio_bridge.remove_stream(silence_key)
             raise RuntimeError(f"Could not connect to private group Voice Chat: {exc}") from exc
@@ -1529,13 +1546,15 @@ class VoiceChatManager:
         )
         try:
             await self.calls.play(target_chat_id, target_stream)
-        except NoActiveGroupCall:
+        except NoActiveGroupCall as exc:
             await self.audio_bridge.remove_stream(capture_key)
             with contextlib.suppress(Exception):
                 await self.calls.leave_call(source_chat_id)
             await self.audio_bridge.remove_stream(silence_key)
             self.sessions.pop(source_chat_id, None)
-            raise
+            raise VoiceBridgeNoActiveGroupCall(
+                f"The target group ({_safe_title(getattr(target_entity, 'title', None)) or target_token}) has no active Voice Chat."
+            ) from exc
         except Exception as exc:
             await self.audio_bridge.remove_stream(capture_key)
             with contextlib.suppress(Exception):

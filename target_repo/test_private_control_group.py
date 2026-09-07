@@ -14,6 +14,9 @@ REPO_DIR = BASE_DIR / "telegram_userbot"
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(BASE_DIR))
 
+import config
+sys.modules["config.config"] = config
+
 import database.mongo as db
 
 
@@ -183,6 +186,51 @@ class TestPrivateControlGroupLocalDB(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mapping["hosted_account_id"], 88888)
         self.assertEqual(mapping["title"], "Test VC Chat")
         self.assertTrue(mapping["active"])
+
+    async def test_join_command_handler_no_active_call_error_message(self):
+        """Verify /join -1002967424342 in private control group reports clear error without NoActiveGroupCall init crash."""
+        from bot.handlers.private_group import private_group_command
+        from plugins.voice_chat import VoiceBridgeNoActiveGroupCall
+
+        await db.save_private_control_group(
+            owner_user_id=12345,
+            hosted_account_id=67890,
+            private_control_group_id=-100888999,
+            title="Private Control HQ",
+        )
+
+        update = MagicMock()
+        update.effective_chat.id = -100888999
+        update.effective_user.id = 12345
+        update.effective_message.text = "/join -1002967424342"
+
+        replies = []
+        async def fake_reply(message, text):
+            replies.append(text)
+
+        context = MagicMock()
+        hosted = MagicMock()
+        hosted.is_running.return_value = True
+        hosted._own_id = 67890
+
+        voice = MagicMock()
+        # Simulate join_bridge raising VoiceBridgeNoActiveGroupCall
+        voice.join_bridge = AsyncMock(
+            side_effect=VoiceBridgeNoActiveGroupCall("The target group (-1002967424342) has no active Voice Chat.")
+        )
+        hosted.client._voice_chat_manager = voice
+
+        manager = MagicMock()
+        manager.get_client.return_value = hosted
+        context.bot_data = {"manager": manager}
+
+        with patch("bot.handlers.private_group.reply_html", side_effect=fake_reply), \
+             patch("bot.handlers.private_group._hosted_for_user", return_value=hosted):
+            await private_group_command(update, context)
+
+        self.assertTrue(len(replies) > 0)
+        self.assertTrue(any("The target group (-1002967424342) has no active Voice Chat" in r for r in replies))
+        self.assertFalse(any("takes 1 positional argument" in r for r in replies))
 
 
 if __name__ == "__main__":

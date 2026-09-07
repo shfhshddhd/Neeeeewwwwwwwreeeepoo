@@ -17,7 +17,14 @@ import config
 sys.modules["config.config"] = config
 
 import database.mongo as db
-from plugins.voice_chat import BassFilter, VoiceChatManager, VoiceBridge, VoiceState
+from pytgcalls.exceptions import NoActiveGroupCall
+from plugins.voice_chat import (
+    BassFilter,
+    VoiceChatManager,
+    VoiceBridge,
+    VoiceState,
+    VoiceBridgeNoActiveGroupCall,
+)
 
 
 class TestAdminPermissions(unittest.IsolatedAsyncioTestCase):
@@ -235,6 +242,136 @@ class TestAudioBridgePipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(vm.bridge)
 
         # Cleanup
+        await vm.shutdown()
+
+    async def test_join_bridge_no_active_vc_source_raises_proper_exception(self):
+        """Regression test: verify no active VC in source group does NOT crash with NoActiveGroupCall.__init__()."""
+        client_mock = MagicMock()
+        client_mock.is_connected.return_value = True
+
+        from telethon.tl import types as tl_types
+        source_chat = MagicMock(spec=tl_types.Chat)
+        source_chat.id = 100111
+        source_chat.title = "Source VC Group"
+
+        client_mock.get_entity = AsyncMock(return_value=source_chat)
+
+        with patch("plugins.voice_chat.PyTgCalls"):
+            vm = VoiceChatManager(client_mock)
+        vm.calls.start = AsyncMock()
+        # Simulate source group having NO active Voice Chat
+        vm._active_group_call = AsyncMock(return_value=None)
+
+        with self.assertRaises(NoActiveGroupCall) as ctx:
+            await vm.join_bridge(source_chat_id=-100100111, target_identifier="-1002967424342")
+
+        # Must not be a TypeError: NoActiveGroupCall.__init__() takes 1 positional argument but 2 were given
+        self.assertNotIsInstance(ctx.exception, TypeError)
+        self.assertIsInstance(ctx.exception, NoActiveGroupCall)
+        self.assertIn("No active Voice Chat in this private control group", str(ctx.exception))
+        await vm.shutdown()
+
+    async def test_join_bridge_no_active_vc_target_reproduces_and_fixes_crash(self):
+        """Regression test for user reproduction: /join -1002967424342 when target VC is not active.
+
+        Before the fix, this triggered:
+        TypeError: NoActiveGroupCall.__init__() takes 1 positional argument but 2 were given
+        After the fix, this raises a proper VoiceBridgeNoActiveGroupCall with clear message.
+        """
+        client_mock = MagicMock()
+        client_mock.is_connected.return_value = True
+
+        from telethon.tl import types as tl_types
+        source_chat = MagicMock(spec=tl_types.Chat)
+        source_chat.id = 100111
+        source_chat.title = "HQ Private VC"
+
+        target_chat = MagicMock(spec=tl_types.Channel)
+        target_chat.id = 2967424342
+        target_chat.megagroup = True
+        target_chat.title = "Target Group VC"
+
+        def get_entity_side_effect(ident):
+            if ident in (100111, -100100111):
+                return source_chat
+            if ident in (2967424342, -1002967424342, "-1002967424342"):
+                return target_chat
+            raise ValueError(f"Unknown entity: {ident}")
+
+        client_mock.get_entity = AsyncMock(side_effect=get_entity_side_effect)
+
+        with patch("plugins.voice_chat.PyTgCalls"):
+            vm = VoiceChatManager(client_mock)
+        vm.calls.start = AsyncMock()
+
+        # Source has active call, but target has NO active call
+        async def active_group_call_side_effect(entity):
+            if entity == source_chat:
+                return MagicMock()
+            return None
+
+        vm._active_group_call = AsyncMock(side_effect=active_group_call_side_effect)
+
+        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
+            mock_peer_id.side_effect = lambda ent: -100100111 if ent == source_chat else -1002967424342
+            with self.assertRaises(NoActiveGroupCall) as ctx:
+                await vm.join_bridge(source_chat_id=-100100111, target_identifier="-1002967424342")
+
+        # Crucial check: verify that TypeError was NOT raised
+        self.assertNotIsInstance(ctx.exception, TypeError)
+        self.assertIsInstance(ctx.exception, NoActiveGroupCall)
+        self.assertIn("The target group", str(ctx.exception))
+        self.assertIn("has no active Voice Chat", str(ctx.exception))
+        await vm.shutdown()
+
+    async def test_join_bridge_pytgcalls_native_no_active_group_call_handled(self):
+        """Verify that if pytgcalls raises native NoActiveGroupCall() (0 args), it is handled cleanly."""
+        client_mock = MagicMock()
+        client_mock.is_connected.return_value = True
+
+        from telethon.tl import types as tl_types
+        source_chat = MagicMock(spec=tl_types.Chat)
+        source_chat.id = 100111
+        source_chat.title = "Source VC"
+
+        target_chat = MagicMock(spec=tl_types.Channel)
+        target_chat.id = 2967424342
+        target_chat.megagroup = True
+        target_chat.title = "Target Group"
+
+        def get_entity_side_effect(ident):
+            if ident in (100111, -100100111):
+                return source_chat
+            if ident in (2967424342, -1002967424342, "-1002967424342"):
+                return target_chat
+            raise ValueError(f"Unknown entity: {ident}")
+
+        client_mock.get_entity = AsyncMock(side_effect=get_entity_side_effect)
+
+        with patch("plugins.voice_chat.PyTgCalls"):
+            vm = VoiceChatManager(client_mock)
+        vm.calls.start = AsyncMock()
+        vm.calls.leave_call = AsyncMock()
+        vm._active_group_call = AsyncMock(return_value=MagicMock())
+
+        # Simulate pytgcalls.play on target raising native NoActiveGroupCall()
+        async def play_side_effect(chat_id, stream):
+            if chat_id == -1002967424342:
+                # py-tgcalls 2.3.3 raises NoActiveGroupCall() with 0 arguments
+                raise NoActiveGroupCall()
+            return None
+
+        vm.calls.play = AsyncMock(side_effect=play_side_effect)
+
+        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
+            mock_peer_id.side_effect = lambda ent: -100100111 if ent == source_chat else -1002967424342
+            with self.assertRaises(NoActiveGroupCall) as ctx:
+                await vm.join_bridge(source_chat_id=-100100111, target_identifier="-1002967424342")
+
+        self.assertNotIsInstance(ctx.exception, TypeError)
+        self.assertIsInstance(ctx.exception, NoActiveGroupCall)
+        self.assertIn("The target group", str(ctx.exception))
+        self.assertIn("has no active Voice Chat", str(ctx.exception))
         await vm.shutdown()
 
 
