@@ -253,17 +253,24 @@ async def private_group_command(
 
     command = match.group("command").lower()
     args = (match.group("args") or "").strip()
+    logger.info("[VC_CONTROL_COMMAND] Chat %s received command /%s (args=%s)", chat.id, command, args)
     try:
         if command == "join":
             if not args:
                 raise ValueError("Usage: /join <group username or chat ID>")
-            text = await voice.join_bridge(source_chat_id=int(chat.id), target_identifier=args)
+            text = await asyncio.wait_for(
+                voice.join_bridge(source_chat_id=int(chat.id), target_identifier=args),
+                timeout=45.0,
+            )
         elif command == "leaveall":
-            text = await voice.leave_all()
+            text = await asyncio.wait_for(voice.leave_all(), timeout=15.0)
         elif command == "leave":
-            text = await voice.leave_bridge(source_chat_id=int(chat.id))
+            text = await asyncio.wait_for(
+                voice.leave_bridge(source_chat_id=int(chat.id)),
+                timeout=15.0,
+            )
         elif command == "leaveplay":
-            text = await voice.stop_all_playback()
+            text = await asyncio.wait_for(voice.stop_all_playback(), timeout=10.0)
         elif command in {"leaverecord", "stoprecord"}:
             text = await voice.stop_record_target(event=chat.id)
         elif command == "level":

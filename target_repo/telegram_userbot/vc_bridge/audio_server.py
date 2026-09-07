@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import math
 import socket
 import struct
+import time
+from array import array
 from typing import Dict, List, Optional
 from aiohttp import web
 
@@ -30,6 +33,22 @@ def _wav_header(data_size: int = 0x7FFFFFFF) -> bytes:
     ])
 
 
+def _calculate_pcm_level(data: bytes) -> tuple[float, int, bool]:
+    """Calculate RMS level (0.0-32767.0), Peak (0-32767), and non-silent flag."""
+    usable = len(data) - (len(data) % 2)
+    if usable < 2:
+        return 0.0, 0, False
+    samples = array("h")
+    samples.frombytes(data[:usable])
+    if not samples:
+        return 0.0, 0, False
+    peak = max(abs(s) for s in samples)
+    sum_sq = sum(s * s for s in samples)
+    rms = math.sqrt(sum_sq / len(samples))
+    is_non_silent = peak > 150
+    return rms, peak, is_non_silent
+
+
 class _LiveStream:
     def __init__(self, cmd: List[str], name: str):
         self.cmd = cmd
@@ -38,6 +57,9 @@ class _LiveStream:
         self.subscribers: List[asyncio.Queue] = []
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self.total_chunks: int = 0
+        self.total_bytes: int = 0
+        self.last_non_silent_at: float = 0.0
 
     async def start(self) -> None:
         self.process = await asyncio.create_subprocess_exec(
@@ -59,14 +81,32 @@ class _LiveStream:
         assert self.process is not None
         assert self.process.stdout is not None
         first_chunk = True
+        last_log_time = time.monotonic()
         try:
             while True:
                 chunk = await self.process.stdout.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                if first_chunk:
+                self.total_chunks += 1
+                self.total_bytes += len(chunk)
+
+                rms, peak, is_non_silent = _calculate_pcm_level(chunk)
+                now = time.monotonic()
+                if is_non_silent:
+                    self.last_non_silent_at = now
+
+                if first_chunk or (now - last_log_time >= 3.0) or (is_non_silent and now - self.last_non_silent_at < 0.1 and now - last_log_time >= 1.0):
                     first_chunk = False
-                    logger.info("[VC_BRIDGE] audio_chunk_captured name=%s bytes=%d", self.name, len(chunk))
+                    last_log_time = now
+                    logger.info(
+                        "[VC_BRIDGE_AUDIO] stream=%s rms=%.1f peak=%d non_silent=%s chunks=%d bytes=%d",
+                        self.name,
+                        rms,
+                        peak,
+                        is_non_silent,
+                        self.total_chunks,
+                        self.total_bytes,
+                    )
                 for q in list(self.subscribers):
                     try:
                         q.put_nowait(chunk)
@@ -202,7 +242,8 @@ class AudioHTTPBridge:
         if stream is None:
             raise web.HTTPNotFound()
 
-        logger.info("[VC_BRIDGE] target_stream_active key=%s stream=%s", key, stream.name)
+        client_ip = request.remote or "unknown"
+        logger.info("[VC_BRIDGE] target_stream_active key=%s stream=%s client=%s", key, stream.name, client_ip)
 
         response = web.StreamResponse(
             status=200,
@@ -216,14 +257,35 @@ class AudioHTTPBridge:
         await response.write(_wav_header())
 
         q = stream.subscribe()
+        bytes_sent = 0
+        chunks_sent = 0
+        last_log = time.monotonic()
         try:
             while True:
                 chunk = await q.get()
                 if not chunk:
                     break
                 await response.write(chunk)
+                bytes_sent += len(chunk)
+                chunks_sent += 1
+                now = time.monotonic()
+                if now - last_log >= 5.0:
+                    last_log = now
+                    logger.info(
+                        "[VC_BRIDGE_TARGET] streaming to target VC: key=%s chunks_sent=%d bytes_sent=%d subscribers=%d",
+                        key,
+                        chunks_sent,
+                        bytes_sent,
+                        len(stream.subscribers),
+                    )
         except (ConnectionError, asyncio.CancelledError, Exception):
             pass
         finally:
             stream.unsubscribe(q)
+            logger.info(
+                "[VC_BRIDGE_TARGET] client disconnected: key=%s total_chunks=%d total_bytes=%d",
+                key,
+                chunks_sent,
+                bytes_sent,
+            )
         return response
