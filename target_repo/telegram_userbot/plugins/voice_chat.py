@@ -1524,6 +1524,11 @@ class VoiceChatManager:
             volume=_SAFE_DEFAULT_VOLUME,
         )
         self.sessions[source_chat_id] = source_state
+        logger.info(
+            "[VC_BRIDGE] source_joined chat_id=%s title=%s",
+            source_chat_id,
+            source_state.chat_title,
+        )
 
         # 5. Connect to target VC with live capture stream from virtual sink monitor
         capture_key = f"capture_{target_chat_id}"
@@ -1570,6 +1575,11 @@ class VoiceChatManager:
         )
         self.sessions[target_chat_id] = target_state
         self.state = target_state
+        logger.info(
+            "[VC_BRIDGE] target_joined chat_id=%s title=%s",
+            target_chat_id,
+            target_state.chat_title,
+        )
 
         # 6. Create bounded relay queue (max 20 frames = ~200ms buffer)
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_BRIDGE_QUEUE_SIZE)

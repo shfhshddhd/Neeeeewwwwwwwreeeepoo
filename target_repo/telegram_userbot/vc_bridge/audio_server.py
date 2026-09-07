@@ -45,6 +45,7 @@ class _LiveStream:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        logger.info("[VC_BRIDGE] ffmpeg_started name=%s cmd=%s", self.name, " ".join(self.cmd))
         self._reader_task = asyncio.create_task(
             self._read_stdout(),
             name=f"livestream-reader-{self.name}",
@@ -57,11 +58,15 @@ class _LiveStream:
     async def _read_stdout(self) -> None:
         assert self.process is not None
         assert self.process.stdout is not None
+        first_chunk = True
         try:
             while True:
                 chunk = await self.process.stdout.read(CHUNK_SIZE)
                 if not chunk:
                     break
+                if first_chunk:
+                    first_chunk = False
+                    logger.info("[VC_BRIDGE] audio_chunk_captured name=%s bytes=%d", self.name, len(chunk))
                 for q in list(self.subscribers):
                     try:
                         q.put_nowait(chunk)
@@ -113,6 +118,11 @@ class _LiveStream:
         if self._stderr_task:
             self._stderr_task.cancel()
             self._stderr_task = None
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(b"")
+            except Exception:
+                pass
         if self.process and self.process.returncode is None:
             self.process.terminate()
             try:
@@ -192,6 +202,8 @@ class AudioHTTPBridge:
         if stream is None:
             raise web.HTTPNotFound()
 
+        logger.info("[VC_BRIDGE] target_stream_active key=%s stream=%s", key, stream.name)
+
         response = web.StreamResponse(
             status=200,
             headers={
@@ -207,8 +219,10 @@ class AudioHTTPBridge:
         try:
             while True:
                 chunk = await q.get()
+                if not chunk:
+                    break
                 await response.write(chunk)
-        except (ConnectionError, asyncio.CancelledError):
+        except (ConnectionError, asyncio.CancelledError, Exception):
             pass
         finally:
             stream.unsubscribe(q)

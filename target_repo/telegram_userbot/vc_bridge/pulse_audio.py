@@ -175,6 +175,8 @@ async def ensure_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> str:
             f"PulseAudio daemon is not reachable after automatic start: {info_or_error}"
         )
 
+    logger.info("[VC_BRIDGE] PulseAudio initialized")
+
     _, existing_sinks, _ = await _run("pactl", "list", "short", "sinks")
     if not any(
         line.split("\t")[1] == sink_name
@@ -194,6 +196,10 @@ async def ensure_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> str:
             logger.info("Created PulseAudio virtual sink '%s' (module id=%s).", sink_name, out)
     else:
         logger.debug("PulseAudio virtual sink '%s' already exists.", sink_name)
+
+    logger.info("[VC_BRIDGE] created sink %s", sink_name)
+    logger.info("[VC_BRIDGE] monitor=%s.monitor", sink_name)
+    logger.info("[VC_BRIDGE] sink_ready monitor=%s.monitor", sink_name)
 
     return f"{sink_name}.monitor"
 
