@@ -13,6 +13,7 @@ DEFAULT_SINK_NAME = "vcrelay"
 MODULE_OWNER_DESCRIPTION = "telegram_userbot_vc_bridge"
 
 _daemon_process: Optional[asyncio.subprocess.Process] = None
+_init_lock = asyncio.Lock()
 
 
 async def _run(*cmd: str) -> Tuple[asyncio.subprocess.Process, str, str]:
@@ -55,24 +56,120 @@ def _prepare_runtime_environment() -> None:
     os.environ["PULSE_SOURCE"] = f"{DEFAULT_SINK_NAME}.monitor"
 
 
+async def parse_sink_inputs() -> list[dict]:
+    """Parse detailed pactl list sink-inputs output into structured dicts."""
+    if not pulseaudio_available():
+        return []
+    _, out, err = await _run("pactl", "list", "sink-inputs")
+    if err or not out.strip():
+        return []
+
+    inputs = []
+    current_input: dict = {}
+    in_properties = False
+
+    for line in out.splitlines():
+        line_str = line.strip()
+        if not line_str:
+            continue
+        if line.startswith("Sink Input #"):
+            if current_input and "index" in current_input:
+                inputs.append(current_input)
+            idx = line.split("#")[1].strip()
+            current_input = {
+                "index": idx,
+                "sink": "unknown",
+                "app": "unknown",
+                "media": "unknown",
+                "binary": "unknown",
+                "driver": "unknown",
+                "properties": {},
+            }
+            in_properties = False
+        elif current_input:
+            if line_str.startswith("Sink:"):
+                current_input["sink"] = line_str.split(":", 1)[1].strip()
+            elif line_str.startswith("Driver:"):
+                current_input["driver"] = line_str.split(":", 1)[1].strip()
+            elif line_str.startswith("Properties:"):
+                in_properties = True
+            elif in_properties and "=" in line_str:
+                k, v = line_str.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"')
+                current_input["properties"][k] = v
+                if k == "application.name":
+                    current_input["app"] = v
+                elif k == "media.name":
+                    current_input["media"] = v
+                elif k == "application.process.binary":
+                    current_input["binary"] = v
+
+    if current_input and "index" in current_input:
+        inputs.append(current_input)
+
+    return inputs
+
+
+def is_pytgcalls_sink_input(item: dict) -> bool:
+    """Filter to identify if a sink input belongs to PyTgCalls/PyAudio/WebRTC source VC playback."""
+    app = item.get("app", "").lower()
+    binary = item.get("binary", "").lower()
+    media = item.get("media", "").lower()
+    driver = item.get("driver", "").lower()
+
+    unrelated_keywords = ["firefox", "chrome", "vlc", "mpv", "spotify", "bot", "system"]
+    for un in unrelated_keywords:
+        if un in app or un in binary or un in media:
+            return False
+
+    target_keywords = ["python", "pytgcalls", "tgcalls", "pyaudio", "webrtc", "alsa"]
+    for tk in target_keywords:
+        if tk in app or tk in binary or tk in media or tk in driver:
+            return True
+
+    return False
+
+
 async def route_sink_inputs_to_vcrelay(sink_name: str = DEFAULT_SINK_NAME) -> int:
-    """Find active PulseAudio sink-inputs and move them to vcrelay."""
+    """Find active PulseAudio sink-inputs and move matching ones to vcrelay."""
     if not pulseaudio_available():
         return 0
-    _, out, err = await _run("pactl", "list", "short", "sink-inputs")
-    if err or not out.strip():
+
+    inputs = await parse_sink_inputs()
+    logger.info("[VC_BRIDGE_PULSE_WATCHDOG] sink_inputs_found count=%d", len(inputs))
+    if not inputs:
+        logger.info("[VC_BRIDGE_PULSE] sink_inputs_found count=0")
         return 0
+
     moved_count = 0
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            input_id = parts[0]
-            curr_sink = parts[1]
-            if curr_sink != sink_name:
-                _, _, move_err = await _run("pactl", "move-sink-input", input_id, sink_name)
-                if not move_err:
-                    moved_count += 1
-                    logger.info("[VC_BRIDGE_PULSE] Moved sink-input %s from %s to %s", input_id, curr_sink, sink_name)
+    for item in inputs:
+        idx = item["index"]
+        app = item["app"]
+        media = item["media"]
+        curr_sink = item["sink"]
+
+        logger.info(
+            '[VC_BRIDGE_PULSE] sink_input index=%s app="%s" media="%s" sink="%s"',
+            idx,
+            app,
+            media,
+            curr_sink,
+        )
+
+        if curr_sink != sink_name and is_pytgcalls_sink_input(item):
+            logger.info(
+                "[VC_BRIDGE_PULSE] relocating sink_input=%s from=%s to=%s",
+                idx,
+                curr_sink,
+                sink_name,
+            )
+            _, _, move_err = await _run("pactl", "move-sink-input", idx, sink_name)
+            if not move_err:
+                moved_count += 1
+                logger.info("[VC_BRIDGE_PULSE] relocated sink_input=%s sink=%s", idx, sink_name)
+                await log_pulseaudio_diagnostics(sink_name)
+
     return moved_count
 
 
@@ -200,7 +297,6 @@ async def _start_daemon(sink_name: str = DEFAULT_SINK_NAME) -> None:
 
     if _daemon_process is not None and _daemon_process.returncode is None:
         logger.info("PulseAudio process is already running.")
-        await asyncio.sleep(1.5)
         return
 
     minimal_config_path = _write_minimal_pulse_config(sink_name)
@@ -224,13 +320,13 @@ async def _start_daemon(sink_name: str = DEFAULT_SINK_NAME) -> None:
         stderr=asyncio.subprocess.PIPE,
     )
     asyncio.create_task(_drain_daemon_stderr(_daemon_process))
-    await asyncio.sleep(1.5)
 
 
-async def ensure_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> str:
-    """Ensure PulseAudio daemon is running and null sink exists.
+async def ensure_pulseaudio_ready(sink_name: str = DEFAULT_SINK_NAME) -> str:
+    """Ensure PulseAudio daemon is reachable and virtual null sink + monitor are ready.
 
-    Returns the device name of the monitor source, e.g. 'vcrelay.monitor'.
+    Idempotent and safe to call multiple times.
+    Returns device name of monitor source, e.g. 'vcrelay.monitor'.
     """
     if not pulseaudio_available():
         raise RuntimeError(
@@ -238,52 +334,103 @@ async def ensure_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> str:
             "Please install it with: apt-get install -y pulseaudio pulseaudio-utils"
         )
 
-    _prepare_runtime_environment()
-    reachable, info_or_error = await pulseaudio_daemon_reachable()
-    if not reachable:
-        logger.warning(
-            "PulseAudio daemon not reachable (%s). Starting automatically...",
-            info_or_error,
-        )
-        await _start_daemon(sink_name)
-        reachable, info_or_error = await pulseaudio_daemon_reachable()
+    async with _init_lock:
+        _prepare_runtime_environment()
 
-    if not reachable:
-        raise RuntimeError(
-            f"PulseAudio daemon is not reachable after automatic start: {info_or_error}"
-        )
+        # Check if already running and sink + monitor exist
+        reachable, _ = await pulseaudio_daemon_reachable()
+        if reachable:
+            _, sinks_out, _ = await _run("pactl", "list", "short", "sinks")
+            _, sources_out, _ = await _run("pactl", "list", "short", "sources")
+            sink_exists = any(
+                line.split("\t")[1] == sink_name
+                for line in sinks_out.splitlines()
+                if "\t" in line
+            )
+            monitor_exists = any(
+                f"{sink_name}.monitor" in line
+                for line in sources_out.splitlines()
+            )
+            if sink_exists and monitor_exists:
+                logger.info("[VC_BRIDGE_PULSE] ensure_ready already_ready")
+                await set_default_pulse_sink_and_source(sink_name)
+                return f"{sink_name}.monitor"
 
-    logger.info("[VC_BRIDGE] PulseAudio initialized")
+        logger.info("[VC_BRIDGE_PULSE] ensure_ready start")
 
-    _, existing_sinks, _ = await _run("pactl", "list", "short", "sinks")
-    if not any(
-        line.split("\t")[1] == sink_name
-        for line in existing_sinks.splitlines()
-        if "\t" in line
-    ):
-        _, out, err = await _run(
-            "pactl",
-            "load-module",
-            "module-null-sink",
-            f"sink_name={sink_name}",
-            f"sink_properties=device.description={MODULE_OWNER_DESCRIPTION}",
-        )
-        if err:
-            logger.error("Failed to create PulseAudio sink '%s': %s", sink_name, err)
+        if reachable:
+            logger.info("[VC_BRIDGE_PULSE] daemon reachable")
         else:
+            await _start_daemon(sink_name)
+            logger.info("[VC_BRIDGE_PULSE] daemon started")
+
+            max_attempts = 10
+            daemon_ready = False
+            last_err = ""
+            for attempt in range(1, max_attempts + 1):
+                logger.info("[VC_BRIDGE_PULSE] waiting_for_daemon attempt=%d", attempt)
+                await asyncio.sleep(0.5)
+                daemon_ready, last_err = await pulseaudio_daemon_reachable()
+                if daemon_ready:
+                    logger.info("[VC_BRIDGE_PULSE] daemon reachable")
+                    break
+
+            if not daemon_ready:
+                raise RuntimeError(
+                    f"PulseAudio daemon is not reachable after automatic start: {last_err}"
+                )
+
+        logger.info("[VC_BRIDGE] PulseAudio initialized")
+
+        _, sinks_out, _ = await _run("pactl", "list", "short", "sinks")
+        sink_exists = any(
+            line.split("\t")[1] == sink_name
+            for line in sinks_out.splitlines()
+            if "\t" in line
+        )
+
+        if sink_exists:
+            logger.info("[VC_BRIDGE_PULSE] vcrelay_exists")
+        else:
+            _, out, err = await _run(
+                "pactl",
+                "load-module",
+                "module-null-sink",
+                f"sink_name={sink_name}",
+                f"sink_properties=device.description={MODULE_OWNER_DESCRIPTION}",
+            )
+            if err:
+                logger.error("Failed to create PulseAudio sink '%s': %s", sink_name, err)
+                raise RuntimeError(f"Failed to create PulseAudio sink '{sink_name}': {err}")
             logger.info("Created PulseAudio virtual sink '%s' (module id=%s).", sink_name, out)
-    else:
-        logger.debug("PulseAudio virtual sink '%s' already exists.", sink_name)
+            logger.info("[VC_BRIDGE_PULSE] vcrelay_created")
 
-    logger.info("[VC_BRIDGE] created sink %s", sink_name)
-    logger.info("[VC_BRIDGE] monitor=%s.monitor", sink_name)
-    logger.info("[VC_BRIDGE] sink_ready monitor=%s.monitor", sink_name)
+        logger.info("[VC_BRIDGE] created sink %s", sink_name)
 
-    await set_default_pulse_sink_and_source(sink_name)
-    await route_sink_inputs_to_vcrelay(sink_name)
-    await log_pulseaudio_diagnostics(sink_name)
+        monitor_ready = False
+        for _ in range(5):
+            _, sources_out, _ = await _run("pactl", "list", "short", "sources")
+            if any(f"{sink_name}.monitor" in line for line in sources_out.splitlines()):
+                monitor_ready = True
+                break
+            await asyncio.sleep(0.2)
 
-    return f"{sink_name}.monitor"
+        if not monitor_ready:
+            raise RuntimeError(f"PulseAudio monitor source {sink_name}.monitor is not ready.")
+
+        logger.info("[VC_BRIDGE_PULSE] monitor_ready name=%s.monitor", sink_name)
+        logger.info("[VC_BRIDGE] monitor=%s.monitor", sink_name)
+        logger.info("[VC_BRIDGE] sink_ready monitor=%s.monitor", sink_name)
+
+        await set_default_pulse_sink_and_source(sink_name)
+        await route_sink_inputs_to_vcrelay(sink_name)
+        await log_pulseaudio_diagnostics(sink_name)
+
+        logger.info("[VC_BRIDGE_PULSE] ensure_ready success")
+        return f"{sink_name}.monitor"
+
+
+ensure_virtual_sink = ensure_pulseaudio_ready
 
 
 async def teardown_virtual_sink(sink_name: str = DEFAULT_SINK_NAME) -> None:

@@ -303,7 +303,8 @@ class TestAudioBridgePipeline(unittest.IsolatedAsyncioTestCase):
         vm.calls.send_frame = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
-        with patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock) as mock_sink, \
+        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_sink, \
+             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
              patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
             mock_sink.return_value = "vcrelay.monitor"
             mock_peer_id.side_effect = lambda ent: -100100111 if ent == source_chat else -100100222
@@ -452,7 +453,8 @@ class TestAudioBridgePipeline(unittest.IsolatedAsyncioTestCase):
 
         vm.calls.play = AsyncMock(side_effect=play_side_effect)
 
-        with patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock) as mock_sink, \
+        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_sink, \
+             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
              patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
             mock_sink.return_value = "vcrelay.monitor"
             mock_peer_id.side_effect = lambda ent: -100100111 if ent == source_chat else -1002967424342

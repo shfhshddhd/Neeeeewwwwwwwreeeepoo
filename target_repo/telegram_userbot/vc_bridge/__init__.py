@@ -7,8 +7,10 @@ from .ffmpeg_utils import (
     build_silence_command_stdout,
 )
 from .pulse_audio import (
+    ensure_pulseaudio_ready,
     ensure_virtual_sink,
     log_pulseaudio_diagnostics,
+    parse_sink_inputs,
     pulseaudio_available,
     pulseaudio_daemon_reachable,
     route_sink_inputs_to_vcrelay,
@@ -21,8 +23,10 @@ __all__ = [
     "build_audio_filters",
     "build_capture_command_stdout",
     "build_silence_command_stdout",
+    "ensure_pulseaudio_ready",
     "ensure_virtual_sink",
     "log_pulseaudio_diagnostics",
+    "parse_sink_inputs",
     "pulseaudio_available",
     "pulseaudio_daemon_reachable",
     "route_sink_inputs_to_vcrelay",

@@ -127,14 +127,24 @@ if "aiohttp" not in sys.modules:
         import aiohttp
         import aiohttp.web
     except ModuleNotFoundError:
+        class MockRunner:
+            async def setup(self):
+                pass
+            async def cleanup(self):
+                pass
+        class MockSite:
+            async def start(self):
+                pass
+            async def stop(self):
+                pass
         aiohttp_mod = types.ModuleType("aiohttp")
         aiohttp_web_mod = types.ModuleType("aiohttp.web")
         aiohttp_web_mod.Request = MagicMock
         aiohttp_web_mod.Response = MagicMock
         aiohttp_web_mod.StreamResponse = MagicMock
         aiohttp_web_mod.Application = MagicMock
-        aiohttp_web_mod.AppRunner = MagicMock
-        aiohttp_web_mod.TCPSite = MagicMock
+        aiohttp_web_mod.AppRunner = lambda *a, **kw: MockRunner()
+        aiohttp_web_mod.TCPSite = lambda *a, **kw: MockSite()
         aiohttp_mod.web = aiohttp_web_mod
         sys.modules["aiohttp"] = aiohttp_mod
         sys.modules["aiohttp.web"] = aiohttp_web_mod

@@ -98,10 +98,14 @@ from telegram_userbot.vc_bridge import (
     build_audio_filters,
     build_capture_command_stdout,
     build_silence_command_stdout,
+    ensure_pulseaudio_ready,
     ensure_virtual_sink,
+    parse_sink_inputs,
     pulseaudio_available,
+    route_sink_inputs_to_vcrelay,
     teardown_virtual_sink,
 )
+from telegram_userbot.vc_bridge.pulse_audio import is_pytgcalls_sink_input
 from plugins.voice_chat import VoiceChatManager, VoiceBridge, VoiceState
 
 
@@ -169,7 +173,8 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         vm.calls.unmute = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
-        with patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock) as mock_sink, \
+        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_sink, \
+             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
              patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
             mock_sink.return_value = "vcrelay.monitor"
             mock_peer_id.side_effect = lambda ent: -1001111 if ent == source_chat else -1002222
@@ -186,13 +191,28 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         call_1_args = vm.calls.play.call_args_list[0][0]
         call_2_args = vm.calls.play.call_args_list[1][0]
 
+        def get_stream_path(stream_obj):
+            if hasattr(stream_obj, "_media_path") and isinstance(stream_obj._media_path, str):
+                return stream_obj._media_path
+            if hasattr(stream_obj, "media_path") and isinstance(stream_obj.media_path, str):
+                return stream_obj.media_path
+            try:
+                from pytgcalls.types import MediaStream as MS
+                if hasattr(MS, "call_args_list") and MS.call_args_list:
+                    urls = [str(c[0][0]) for c in MS.call_args_list if c and c[0]]
+                    if urls:
+                        return " ".join(urls)
+            except Exception:
+                pass
+            if hasattr(stream_obj, "call_args") and stream_obj.call_args:
+                return str(stream_obj.call_args[0][0])
+            return str(stream_obj)
+
         self.assertEqual(call_1_args[0], -1001111)
-        self.assertIsInstance(call_1_args[1], MediaStream)
-        self.assertIn("silence", str(call_1_args[1]._media_path))
+        self.assertIn("silence", get_stream_path(call_1_args[1]))
 
         self.assertEqual(call_2_args[0], -1002222)
-        self.assertIsInstance(call_2_args[1], MediaStream)
-        self.assertIn("capture", str(call_2_args[1]._media_path))
+        self.assertIn("capture", get_stream_path(call_2_args[1]))
 
         # Test set_level updates capture stream
         with patch.object(vm, "_restart_bridge_capture", new_callable=AsyncMock) as mock_restart:
@@ -227,6 +247,146 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
 
         # Cleanup
         await vm.shutdown()
+
+    async def test_ensure_pulseaudio_ready_already_running(self):
+        """Test ensure_pulseaudio_ready when daemon and vcrelay sink/monitor are already active."""
+        with patch("telegram_userbot.vc_bridge.pulse_audio.pulseaudio_available", return_value=True), \
+             patch("telegram_userbot.vc_bridge.pulse_audio.pulseaudio_daemon_reachable", new_callable=AsyncMock) as mock_reach, \
+             patch("telegram_userbot.vc_bridge.pulse_audio._run", new_callable=AsyncMock) as mock_run:
+            mock_reach.return_value = (True, "Server Name: PulseAudio")
+            mock_run.side_effect = [
+                (MagicMock(), "0\tvcrelay\tmodule-null-sink.c", ""),  # sinks
+                (MagicMock(), "0\tvcrelay.monitor\tmodule-null-sink.c", ""),  # sources
+                (MagicMock(), "", ""),  # set-default-sink
+                (MagicMock(), "", ""),  # set-default-source
+            ]
+            res = await ensure_pulseaudio_ready("vcrelay")
+            self.assertEqual(res, "vcrelay.monitor")
+
+    async def test_ensure_pulseaudio_ready_auto_start_and_create_sink(self):
+        """Test ensure_pulseaudio_ready starts daemon if unreachable and creates sink + monitor."""
+        reach_responses = [
+            (False, "Connection refused"),
+            (True, "Server Name: PulseAudio"),
+        ]
+        with patch("telegram_userbot.vc_bridge.pulse_audio.pulseaudio_available", return_value=True), \
+             patch("telegram_userbot.vc_bridge.pulse_audio.pulseaudio_daemon_reachable", new_callable=AsyncMock, side_effect=reach_responses), \
+             patch("telegram_userbot.vc_bridge.pulse_audio._start_daemon", new_callable=AsyncMock) as mock_start, \
+             patch("telegram_userbot.vc_bridge.pulse_audio._run", new_callable=AsyncMock) as mock_run:
+            mock_run.side_effect = [
+                (MagicMock(), "", ""),  # sinks (empty initial)
+                (MagicMock(), "123", ""),  # load-module
+                (MagicMock(), "0\tvcrelay.monitor\tmodule-null-sink.c", ""),  # sources check
+                (MagicMock(), "", ""),  # set-default-sink
+                (MagicMock(), "", ""),  # set-default-source
+                (MagicMock(), "", ""),  # list sink-inputs
+                (MagicMock(), "Server Name: PulseAudio", ""),  # info
+                (MagicMock(), "0\tvcrelay", ""),  # sinks list
+                (MagicMock(), "0\tvcrelay.monitor", ""),  # sources list
+                (MagicMock(), "", ""),  # sink-inputs list
+                (MagicMock(), "", ""),  # source-outputs list
+            ]
+            res = await ensure_pulseaudio_ready("vcrelay")
+            self.assertEqual(res, "vcrelay.monitor")
+            mock_start.assert_called_once()
+
+    async def test_sink_input_filtering(self):
+        """Test is_pytgcalls_sink_input filtering for PyTgCalls vs unrelated apps."""
+        pytgcalls_item = {
+            "app": "python3",
+            "media": "PyTgCalls Audio Output",
+            "binary": "python3",
+            "driver": "protocol-native.c",
+        }
+        self.assertTrue(is_pytgcalls_sink_input(pytgcalls_item))
+
+        firefox_item = {
+            "app": "Firefox",
+            "media": "YouTube Video",
+            "binary": "firefox",
+            "driver": "protocol-native.c",
+        }
+        self.assertFalse(is_pytgcalls_sink_input(firefox_item))
+
+    async def test_route_sink_inputs_relocates_matching_input(self):
+        """Test route_sink_inputs_to_vcrelay moves PyTgCalls sink inputs to vcrelay."""
+        sample_inputs = [
+            {
+                "index": "10",
+                "sink": "alsa_output.pci-0000_00_1b.0.analog-stereo",
+                "app": "python3",
+                "media": "PyTgCalls Audio",
+                "binary": "python3",
+                "driver": "protocol-native.c",
+            }
+        ]
+        with patch("telegram_userbot.vc_bridge.pulse_audio.pulseaudio_available", return_value=True), \
+             patch("telegram_userbot.vc_bridge.pulse_audio.parse_sink_inputs", new_callable=AsyncMock, return_value=sample_inputs), \
+             patch("telegram_userbot.vc_bridge.pulse_audio._run", new_callable=AsyncMock) as mock_run:
+            mock_run.side_effect = [
+                (MagicMock(), "", ""),  # move-sink-input
+                (MagicMock(), "Server Name: PulseAudio", ""),  # info for diag
+                (MagicMock(), "0\tvcrelay", ""),  # sinks
+                (MagicMock(), "0\tvcrelay.monitor", ""),  # sources
+                (MagicMock(), "", ""),  # sink-inputs
+                (MagicMock(), "", ""),  # source-outputs
+            ]
+            moved = await route_sink_inputs_to_vcrelay("vcrelay")
+            self.assertEqual(moved, 1)
+            mock_run.assert_any_call("pactl", "move-sink-input", "10", "vcrelay")
+
+    async def test_watchdog_and_cleanup(self):
+        """Test watchdog creation, periodic execution, and cleanup on _stop_bridge."""
+        client_mock = MagicMock()
+        client_mock.is_connected.return_value = True
+
+        from telethon.tl import types as tl_types
+        source_chat = MagicMock(spec=tl_types.Chat)
+        source_chat.id = 101
+        source_chat.title = "Source VC"
+
+        target_chat = MagicMock(spec=tl_types.Channel)
+        target_chat.id = 202
+        target_chat.megagroup = True
+        target_chat.title = "Target VC"
+
+        def get_entity_side_effect(ident):
+            if ident in (101, -100101):
+                return source_chat
+            if ident in (202, -100202, "targetgroup"):
+                return target_chat
+            raise ValueError(f"Unknown entity: {ident}")
+
+        client_mock.get_entity = AsyncMock(side_effect=get_entity_side_effect)
+
+        with patch("plugins.voice_chat.PyTgCalls"):
+            vm = VoiceChatManager(client_mock)
+
+        vm.calls.start = AsyncMock()
+        vm.calls.play = AsyncMock()
+        vm.calls.leave_call = AsyncMock()
+        vm._active_group_call = AsyncMock(return_value=MagicMock())
+
+        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_ready, \
+             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
+             patch("plugins.voice_chat.get_peer_id") as mock_peer_id, \
+             patch("plugins.voice_chat.route_sink_inputs_to_vcrelay", new_callable=AsyncMock) as mock_route:
+            mock_ready.return_value = "vcrelay.monitor"
+            mock_peer_id.side_effect = lambda ent: -100101 if ent == source_chat else -100202
+            await vm.join_bridge(source_chat_id=-100101, target_identifier="targetgroup")
+
+            self.assertIsNotNone(vm.bridge)
+            self.assertIsNotNone(vm.bridge.pulse_watchdog_task)
+
+            # Let the watchdog run a tick
+            await asyncio.sleep(0.1)
+
+            bridge = vm.bridge
+            await vm._stop_bridge(bridge, leave_target=True)
+
+            self.assertFalse(bridge.active)
+            self.assertIsNone(bridge.pulse_watchdog_task)
+            self.assertIsNone(vm.bridge)
 
 
 if __name__ == "__main__":

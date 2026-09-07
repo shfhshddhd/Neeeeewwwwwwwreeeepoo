@@ -45,6 +45,7 @@ from telegram_userbot.vc_bridge import (
     AudioHTTPBridge,
     build_capture_command_stdout,
     build_silence_command_stdout,
+    ensure_pulseaudio_ready,
     ensure_virtual_sink,
     log_pulseaudio_diagnostics,
     pulseaudio_available,
@@ -1535,11 +1536,12 @@ class VoiceChatManager:
         sink_name = getattr(self, "pulse_sink_name", "vcrelay")
         logger.info("[VC_JOIN_TRACE] Step 3: Setting up PulseAudio virtual sink %s...", sink_name)
         try:
-            monitor_source = await asyncio.wait_for(ensure_virtual_sink(sink_name), timeout=10.0)
+            monitor_source = await asyncio.wait_for(ensure_pulseaudio_ready(sink_name), timeout=15.0)
         except Exception as exc:
             logger.error("[VC_JOIN_TRACE] Failed to setup virtual sink %s: %s", sink_name, exc)
             raise RuntimeError(f"Could not setup audio relay sink: {exc}") from exc
         logger.info("[VC_JOIN_TRACE] Step 3a: Virtual sink ready: %s (took %.2fs)", monitor_source, time.monotonic() - t0)
+        await log_pulseaudio_diagnostics(sink_name)
 
         t0 = time.monotonic()
         await self.audio_bridge.start()
@@ -1712,20 +1714,39 @@ class VoiceChatManager:
                 bridge.capture_key,
                 cmd,
                 name=f"capture-{bridge.target_chat_id}",
+                source_id=bridge.source_chat_id,
+                target_id=bridge.target_chat_id,
             )
 
     async def _pulse_routing_watchdog(self, bridge: VoiceBridge, sink_name: str) -> None:
         """Periodically route any active PulseAudio sink-inputs to vcrelay."""
+        logger.info(
+            "[VC_BRIDGE_PULSE_WATCHDOG] starting source=%s target=%s",
+            bridge.source_chat_id,
+            bridge.target_chat_id,
+        )
+        task = asyncio.current_task()
+        task_name = task.get_name() if task and hasattr(task, "get_name") else "pulse-routing"
+        logger.info("[VC_BRIDGE_PULSE_WATCHDOG] started task=%s", task_name)
+        await log_pulseaudio_diagnostics(sink_name)
+
         try:
             while bridge.active:
-                await asyncio.sleep(2.0)
-                if not bridge.active:
-                    break
+                logger.info(
+                    "[VC_BRIDGE_PULSE_WATCHDOG] tick source=%s target=%s",
+                    bridge.source_chat_id,
+                    bridge.target_chat_id,
+                )
+                logger.info("[VC_BRIDGE_PULSE_WATCHDOG] scanning_sink_inputs")
                 await route_sink_inputs_to_vcrelay(sink_name)
+                await asyncio.sleep(3.0)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             logger.debug("Error in _pulse_routing_watchdog: %s", exc)
+        finally:
+            logger.info("[VC_BRIDGE_PULSE_WATCHDOG] stopping")
+            logger.info("[VC_BRIDGE_PULSE_WATCHDOG] stopped")
 
     async def _stop_bridge(self, bridge: VoiceBridge, leave_target: bool = True) -> None:
         logger.info(
@@ -1736,10 +1757,12 @@ class VoiceChatManager:
         )
         bridge.active = False
         if bridge.pulse_watchdog_task is not None and bridge.pulse_watchdog_task is not asyncio.current_task():
+            logger.info("[VC_BRIDGE_PULSE_WATCHDOG] stopping")
             bridge.pulse_watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(bridge.pulse_watchdog_task, timeout=2.0)
             bridge.pulse_watchdog_task = None
+            logger.info("[VC_BRIDGE_PULSE_WATCHDOG] stopped")
         if bridge.relay_task is not None and bridge.relay_task is not asyncio.current_task():
             bridge.relay_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -1767,6 +1790,8 @@ class VoiceChatManager:
         self.sessions.pop(bridge.source_chat_id, None)
         if self.bridge is bridge:
             self.bridge = None
+        sink_name = getattr(self, "pulse_sink_name", "vcrelay")
+        await log_pulseaudio_diagnostics(sink_name)
         logger.info("[VC_LEAVE_TRACE] _stop_bridge completed successfully")
 
     async def leave_bridge(self, source_chat_id: int | None = None) -> str:
