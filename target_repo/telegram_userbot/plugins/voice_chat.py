@@ -27,6 +27,7 @@ from pytgcalls.exceptions import NoActiveGroupCall
 from pytgcalls import PyTgCalls
 from pytgcalls.pytgcalls_session import PyTgCallsSession
 from pytgcalls.types import (
+    AudioQuality,
     Device,
     ExternalMedia,
     MediaStream,
@@ -40,6 +41,14 @@ from telethon.tl import types as tl_types
 from telethon.utils import get_peer_id
 
 from plugins.bot import add_handler
+from telegram_userbot.vc_bridge import (
+    AudioHTTPBridge,
+    build_capture_command_stdout,
+    build_silence_command_stdout,
+    ensure_virtual_sink,
+    pulseaudio_available,
+    teardown_virtual_sink,
+)
 
 try:
     import yt_dlp
@@ -151,6 +160,12 @@ class VoiceBridge:
     relayed_bytes: int = 0
     last_frame_at: float | None = None
     bass_filter: BassFilter = field(default_factory=BassFilter)
+    monitor_source: str = ""
+    silence_key: str = ""
+    capture_key: str = ""
+    silence_url: str = ""
+    capture_url: str = ""
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _safe_title(value: str) -> str:
@@ -274,6 +289,8 @@ class VoiceChatManager:
         self._started = False
         self._tasks: set[asyncio.Task] = set()
         self._temp_dir = Path(tempfile.mkdtemp(prefix="telegram-userbot-vc-"))
+        self.audio_bridge: AudioHTTPBridge = AudioHTTPBridge()
+        self.pulse_sink_name: str = "vcrelay"
 
     def get_state(self, chat_id: int | None = None) -> VoiceState | None:
         if chat_id is None:
@@ -1411,21 +1428,6 @@ class VoiceChatManager:
         if await self._active_group_call(source_entity) is None:
             raise NoActiveGroupCall("No active Voice Chat in this private control group. Start a Voice Chat here first.")
 
-        source_state = self.get_state(source_chat_id)
-        if source_state is None:
-            try:
-                await self.calls.play(source_chat_id, None)
-            except NoActiveGroupCall:
-                raise
-            except Exception as exc:
-                raise RuntimeError(f"Could not connect to private group Voice Chat: {exc}") from exc
-            source_state = VoiceState(
-                chat_id=source_chat_id,
-                chat_title=_safe_title(getattr(source_entity, "title", None)),
-                volume=_SAFE_DEFAULT_VOLUME,
-            )
-            self.sessions[source_chat_id] = source_state
-
         # 2. Resolve target entity
         target_token = target_identifier.strip()
         try:
@@ -1467,18 +1469,79 @@ class VoiceChatManager:
         if self.bridge is not None:
             await self._stop_bridge(self.bridge, leave_target=True)
 
-        # 3. Connect to target VC with external PCM stream for microphone injection
-        stream = MediaStream(
-            ExternalMedia.AUDIO,
-            AudioParameters(bitrate=48000, channels=1),
-            audio_flags=MediaStream.Flags.REQUIRED,
+        # 3. Setup PulseAudio virtual sink and HTTP streaming bridge
+        sink_name = getattr(self, "pulse_sink_name", "vcrelay")
+        try:
+            monitor_source = await ensure_virtual_sink(sink_name)
+        except Exception as exc:
+            raise RuntimeError(f"Could not setup audio relay sink: {exc}") from exc
+
+        await self.audio_bridge.start()
+
+        # 4. Connect to source VC (feeding silence so connection stays open and plays incoming audio to virtual sink)
+        silence_key = f"silence_{source_chat_id}"
+        silence_cmd = build_silence_command_stdout()
+        silence_url = await self.audio_bridge.register_stream(
+            silence_key,
+            silence_cmd,
+            name=f"silence-{source_chat_id}",
+        )
+        await asyncio.sleep(0.3)
+        source_stream = MediaStream(
+            silence_url,
+            AudioQuality.STUDIO,
             video_flags=MediaStream.Flags.IGNORE,
         )
         try:
-            await self.calls.play(target_chat_id, stream)
+            await self.calls.play(source_chat_id, source_stream)
         except NoActiveGroupCall:
+            await self.audio_bridge.remove_stream(silence_key)
             raise
         except Exception as exc:
+            await self.audio_bridge.remove_stream(silence_key)
+            raise RuntimeError(f"Could not connect to private group Voice Chat: {exc}") from exc
+
+        source_state = VoiceState(
+            chat_id=source_chat_id,
+            chat_title=_safe_title(getattr(source_entity, "title", None)),
+            volume=_SAFE_DEFAULT_VOLUME,
+        )
+        self.sessions[source_chat_id] = source_state
+
+        # 5. Connect to target VC with live capture stream from virtual sink monitor
+        capture_key = f"capture_{target_chat_id}"
+        capture_cmd = build_capture_command_stdout(
+            monitor_source,
+            level=_BRIDGE_DEFAULT_LEVEL,
+            bass=0,
+            muted=False,
+        )
+        capture_url = await self.audio_bridge.register_stream(
+            capture_key,
+            capture_cmd,
+            name=f"capture-{target_chat_id}",
+        )
+        await asyncio.sleep(0.3)
+        target_stream = MediaStream(
+            capture_url,
+            AudioQuality.STUDIO,
+            video_flags=MediaStream.Flags.IGNORE,
+        )
+        try:
+            await self.calls.play(target_chat_id, target_stream)
+        except NoActiveGroupCall:
+            await self.audio_bridge.remove_stream(capture_key)
+            with contextlib.suppress(Exception):
+                await self.calls.leave_call(source_chat_id)
+            await self.audio_bridge.remove_stream(silence_key)
+            self.sessions.pop(source_chat_id, None)
+            raise
+        except Exception as exc:
+            await self.audio_bridge.remove_stream(capture_key)
+            with contextlib.suppress(Exception):
+                await self.calls.leave_call(source_chat_id)
+            await self.audio_bridge.remove_stream(silence_key)
+            self.sessions.pop(source_chat_id, None)
             raise RuntimeError(f"Could not connect to target Voice Chat: {exc}") from exc
 
         target_state = VoiceState(
@@ -1489,7 +1552,7 @@ class VoiceChatManager:
         self.sessions[target_chat_id] = target_state
         self.state = target_state
 
-        # 4. Create bounded relay queue (max 20 frames = ~200ms buffer)
+        # 6. Create bounded relay queue (max 20 frames = ~200ms buffer)
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_BRIDGE_QUEUE_SIZE)
         bridge = VoiceBridge(
             source_chat_id=source_chat_id,
@@ -1501,6 +1564,11 @@ class VoiceChatManager:
             volume=100,
             level=_BRIDGE_DEFAULT_LEVEL,
             bass=0,
+            monitor_source=monitor_source,
+            silence_key=silence_key,
+            capture_key=capture_key,
+            silence_url=silence_url,
+            capture_url=capture_url,
         )
         bridge.relay_task = asyncio.create_task(
             self._send_bridge_frames(bridge),
@@ -1511,15 +1579,32 @@ class VoiceChatManager:
         self.bridge = bridge
 
         logger.info(
-            "Voice bridge active: source=%s target=%s (%s).",
+            "Voice bridge active: source=%s target=%s (%s) capture_url=%s.",
             source_chat_id,
             target_chat_id,
             target_state.chat_title,
+            capture_url,
         )
         return (
             f"✅ Hosted account joined target Voice Chat <b>{escape(target_state.chat_title)}</b> "
             f"(<code>{target_chat_id}</code>) and connected audio bridge from private VC."
         )
+
+    async def _restart_bridge_capture(self, bridge: VoiceBridge) -> None:
+        if not bridge.active or not bridge.capture_key or not bridge.monitor_source:
+            return
+        async with bridge.lock:
+            cmd = build_capture_command_stdout(
+                bridge.monitor_source,
+                level=bridge.level,
+                bass=bridge.bass,
+                muted=bridge.muted,
+            )
+            await self.audio_bridge.register_stream(
+                bridge.capture_key,
+                cmd,
+                name=f"capture-{bridge.target_chat_id}",
+            )
 
     async def _stop_bridge(self, bridge: VoiceBridge, leave_target: bool = True) -> None:
         bridge.active = False
@@ -1531,12 +1616,21 @@ class VoiceChatManager:
         while not bridge.queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
                 bridge.queue.get_nowait()
+        if bridge.capture_key:
+            with contextlib.suppress(Exception):
+                await self.audio_bridge.remove_stream(bridge.capture_key)
+        if bridge.silence_key:
+            with contextlib.suppress(Exception):
+                await self.audio_bridge.remove_stream(bridge.silence_key)
         if leave_target:
             with contextlib.suppress(Exception):
                 await self.calls.leave_call(bridge.target_chat_id)
             self.sessions.pop(bridge.target_chat_id, None)
             if self.state is bridge.target_state:
                 self.state = None
+        with contextlib.suppress(Exception):
+            await self.calls.leave_call(bridge.source_chat_id)
+        self.sessions.pop(bridge.source_chat_id, None)
         if self.bridge is bridge:
             self.bridge = None
 
@@ -1581,6 +1675,7 @@ class VoiceChatManager:
         if self.bridge is not None:
             self.bridge.level = value
             self.bridge.volume = volume
+            await self._restart_bridge_capture(self.bridge)
         if self.state is not None:
             self.state.volume = volume
         return f"🎚 Level set to {value}/25."
@@ -1590,6 +1685,7 @@ class VoiceChatManager:
             raise ValueError("Bass must be between 0 and 15.")
         if self.bridge is not None:
             self.bridge.bass = value
+            await self._restart_bridge_capture(self.bridge)
         state = self.get_state(chat_id)
         if state is not None:
             state.bass = value
@@ -1598,6 +1694,7 @@ class VoiceChatManager:
     async def mute_bridge(self) -> str:
         if self.bridge is not None:
             self.bridge.muted = True
+            await self._restart_bridge_capture(self.bridge)
             with contextlib.suppress(Exception):
                 await self.calls.mute(self.bridge.target_chat_id)
             return "🔇 Target Voice Chat stream muted."
@@ -1608,6 +1705,7 @@ class VoiceChatManager:
     async def unmute_bridge(self) -> str:
         if self.bridge is not None:
             self.bridge.muted = False
+            await self._restart_bridge_capture(self.bridge)
             with contextlib.suppress(Exception):
                 await self.calls.unmute(self.bridge.target_chat_id)
             return "🔊 Target Voice Chat stream unmuted."
@@ -1635,6 +1733,10 @@ class VoiceChatManager:
         if self.bridge is not None:
             with contextlib.suppress(Exception):
                 await self._stop_bridge(self.bridge, leave_target=True)
+        with contextlib.suppress(Exception):
+            await self.audio_bridge.stop()
+        with contextlib.suppress(Exception):
+            await teardown_virtual_sink(self.pulse_sink_name)
         for chat_id, state in list(self.sessions.items()):
             state.closing = True
             if state.recording_path is not None:
