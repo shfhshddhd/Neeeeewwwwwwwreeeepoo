@@ -1778,18 +1778,19 @@ class VoiceChatManager:
         )
         self.bridge = bridge
 
-        # 4. Join the source VC as a receive-only call.
+        # 4. Join the source VC in playback/record mode.
         #
         # In PyTgCalls 2.3.3, MediaStream(ExternalMedia.AUDIO, ...) declares
         # an outgoing external microphone source. It cannot be used to
-        # capture the source VC's playback. Passing None joins the call
-        # without replacing its playback path, so on_update receives the
-        # source participants' PCM as StreamFrames with
-        # Direction.INCOMING/Device.SPEAKER.
+        # capture the source VC's playback.  ``play(..., None)`` selects the
+        # CAPTURE/outgoing source mode, so it does not expose incoming
+        # playback frames to this bridge.  ``record(..., None)`` selects
+        # PLAYBACK mode, which makes the source participants' PCM arrive in
+        # on_update as StreamFrames with Direction.INCOMING/Device.SPEAKER.
         t0 = time.monotonic()
-        logger.info("[VC_JOIN_TRACE] Step 4: Joining source VC %s as receive-only...", source_chat_id)
+        logger.info("[VC_JOIN_TRACE] Step 4: Joining source VC %s in playback capture mode...", source_chat_id)
         try:
-            await asyncio.wait_for(self.calls.play(source_chat_id, None), timeout=25.0)
+            await asyncio.wait_for(self.calls.record(source_chat_id, None), timeout=25.0)
         except NoActiveGroupCall as exc:
             self.bridge = None
             raise VoiceBridgeNoActiveGroupCall(

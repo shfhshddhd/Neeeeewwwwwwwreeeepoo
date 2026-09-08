@@ -299,6 +299,7 @@ class TestAudioBridgePipeline(unittest.IsolatedAsyncioTestCase):
         # Mock pytgcalls
         vm.calls.start = AsyncMock()
         vm.calls.play = AsyncMock()
+        vm.calls.record = AsyncMock()
         vm.calls.leave_call = AsyncMock()
         vm.calls.send_frame = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
@@ -441,6 +442,7 @@ class TestAudioBridgePipeline(unittest.IsolatedAsyncioTestCase):
         with patch("plugins.voice_chat.PyTgCalls"):
             vm = VoiceChatManager(client_mock)
         vm.calls.start = AsyncMock()
+        vm.calls.record = AsyncMock()
         vm.calls.leave_call = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 

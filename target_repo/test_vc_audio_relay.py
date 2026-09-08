@@ -168,6 +168,7 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
 
         vm.calls.start = AsyncMock()
         vm.calls.play = AsyncMock()
+        vm.calls.record = AsyncMock()
         vm.calls.leave_call = AsyncMock()
         vm.calls.mute = AsyncMock()
         vm.calls.unmute = AsyncMock()
@@ -181,12 +182,13 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(vm.bridge)
         self.assertTrue(vm.bridge.active)
 
-        # Check PyTgCalls.play calls:
-        # First call: source_chat_id with MediaStream
-        # Second call: target_chat_id with MediaStream
-        self.assertEqual(vm.calls.play.call_count, 2)
-        call_1_args = vm.calls.play.call_args_list[0][0]
-        call_2_args = vm.calls.play.call_args_list[1][0]
+        # Check PyTgCalls calls:
+        # Source uses record(..., None) to select incoming playback frames.
+        # Target uses play(..., MediaStream) for external PCM input.
+        vm.calls.record.assert_called_once_with(-1001111, None)
+        self.assertEqual(vm.calls.play.call_count, 1)
+        call_1_args = vm.calls.record.call_args[0]
+        call_2_args = vm.calls.play.call_args[0]
 
         self.assertEqual(call_1_args[0], -1001111)
         self.assertEqual(call_2_args[0], -1002222)
@@ -340,6 +342,7 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
 
         vm.calls.start = AsyncMock()
         vm.calls.play = AsyncMock()
+        vm.calls.record = AsyncMock()
         vm.calls.leave_call = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
@@ -389,6 +392,7 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
 
         vm.calls.start = AsyncMock()
         vm.calls.play = AsyncMock()
+        vm.calls.record = AsyncMock()
         vm.calls.leave_call = AsyncMock()
         vm.calls.send_frame = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
