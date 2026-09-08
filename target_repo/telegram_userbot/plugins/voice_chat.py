@@ -453,13 +453,19 @@ class VoiceChatManager:
                     or device_raw == getattr(Device, "SPEAKER", "SPEAKER")
                     or str(device_raw).upper() in ("SPEAKER", "DEVICE.SPEAKER", "0")
                 )
+                # The source leg is joined without an outgoing media source.
+                # Therefore only Telegram playback frames (incoming speaker
+                # PCM) are valid bridge input.  In particular, do not accept
+                # an outgoing/external-media frame here: ExternalMedia.AUDIO
+                # is the target leg's microphone input, not a source-VC
+                # receiver.
                 is_source_bridge = (
                     self.bridge is not None
                     and self.bridge.active
                     and self.bridge.source_chat_id == update_chat_id
                 )
 
-                if not ((is_incoming and is_speaker) or is_source_bridge):
+                if not (is_incoming and is_speaker and is_source_bridge):
                     stats.events_rejected += 1
                     if stats.events_rejected <= 5 or (now - stats.last_frame_log) >= 2.5:
                         logger.info(
@@ -501,7 +507,7 @@ class VoiceChatManager:
 
                 # 1. Source -> Target Audio Bridge Relay (PCM16, 48kHz, mono)
                 bridge = self.bridge
-                if is_source_bridge and bridge is not None and bridge.active:
+                if bridge is not None and bridge.active and is_source_bridge:
                     for payload in all_payloads:
                         if payload:
                             stats.queue_frames += 1
@@ -1772,17 +1778,18 @@ class VoiceChatManager:
         )
         self.bridge = bridge
 
-        # 4. Connect to source VC via native ExternalMedia stream
+        # 4. Join the source VC as a receive-only call.
+        #
+        # In PyTgCalls 2.3.3, MediaStream(ExternalMedia.AUDIO, ...) declares
+        # an outgoing external microphone source. It cannot be used to
+        # capture the source VC's playback. Passing None joins the call
+        # without replacing its playback path, so on_update receives the
+        # source participants' PCM as StreamFrames with
+        # Direction.INCOMING/Device.SPEAKER.
         t0 = time.monotonic()
-        source_stream = MediaStream(
-            ExternalMedia.AUDIO,
-            AudioParameters(bitrate=48000, channels=1),
-            audio_flags=MediaStream.Flags.REQUIRED,
-            video_flags=MediaStream.Flags.IGNORE,
-        )
-        logger.info("[VC_JOIN_TRACE] Step 4: Connecting to source VC %s via PyTgCalls...", source_chat_id)
+        logger.info("[VC_JOIN_TRACE] Step 4: Joining source VC %s as receive-only...", source_chat_id)
         try:
-            await asyncio.wait_for(self.calls.play(source_chat_id, source_stream), timeout=25.0)
+            await asyncio.wait_for(self.calls.play(source_chat_id, None), timeout=25.0)
         except NoActiveGroupCall as exc:
             self.bridge = None
             raise VoiceBridgeNoActiveGroupCall(
@@ -1801,7 +1808,9 @@ class VoiceChatManager:
             source_state.chat_title,
         )
 
-        # 5. Connect to target VC via native ExternalMedia stream
+        # 5. Connect to target VC with the supported external PCM input.
+        # send_frame(target, Device.MICROPHONE, pcm16le) feeds the captured
+        # source frames to Telegram users in the target VC.
         t0 = time.monotonic()
         target_stream = MediaStream(
             ExternalMedia.AUDIO,

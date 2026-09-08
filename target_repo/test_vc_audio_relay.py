@@ -139,8 +139,8 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bridge.is_stream_alive("test_stream"))
         await bridge.stop()
 
-    async def test_voice_chat_manager_join_bridge_uses_mediastream(self):
-        """Verify join_bridge configures native ExternalMedia streams on source and target."""
+    async def test_voice_chat_manager_join_bridge_uses_receive_and_external_streams(self):
+        """Verify source receive-only join and target external PCM input."""
         client_mock = MagicMock()
         client_mock.is_connected.return_value = True
 
@@ -190,6 +190,12 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_1_args[0], -1001111)
         self.assertEqual(call_2_args[0], -1002222)
+        self.assertIsNone(call_1_args[1])
+
+        target_stream = call_2_args[1]
+        self.assertTrue(target_stream._is_audio_external)
+        self.assertEqual(target_stream._audio_parameters.bitrate, 48000)
+        self.assertEqual(target_stream._audio_parameters.channels, 1)
 
         # Test set_level updates bridge level and volume
         await vm.set_level(15)
@@ -391,17 +397,16 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
             mock_peer_id.side_effect = lambda ent: -100101 if ent == source_chat else -100202
             await vm.join_bridge(source_chat_id=-100101, target_identifier="targetgroup")
 
-        # Simulate incoming StreamFrames update from source VC
-        from pytgcalls.types import StreamFrames, Device
+        # Simulate actual incoming playback StreamFrames from source VC.
+        from pytgcalls.types import Device, Direction, Frame, StreamFrames
 
-        mock_frame = MagicMock()
-        mock_frame.frame = b"\x10\x20" * 480  # 960 bytes of non-zero audio
-
-        update = MagicMock(spec=StreamFrames)
-        update.chat_id = -100101
-        update.direction = "INCOMING"
-        update.device = "SPEAKER"
-        update.frames = [mock_frame]
+        pcm = b"\x10\x20" * 480  # one 10 ms, 48 kHz mono PCM16 frame
+        update = StreamFrames(
+            -100101,
+            Direction.INCOMING,
+            Device.SPEAKER,
+            [Frame(1, pcm, Frame.Info())],
+        )
 
         # Call on_update
         await vm._on_update_handler(vm.calls, update)
@@ -414,6 +419,19 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         send_args = vm.calls.send_frame.call_args[0]
         self.assertEqual(send_args[0], -100202)  # target_chat_id
         self.assertEqual(len(send_args[2]), 960)  # 960 bytes frame
+
+        # Outgoing/external-media frames from the source leg are not playback
+        # audio and must not be forwarded.
+        sent_count = vm.calls.send_frame.call_count
+        outgoing = StreamFrames(
+            -100101,
+            Direction.OUTGOING,
+            Device.MICROPHONE,
+            [Frame(1, pcm, Frame.Info())],
+        )
+        await vm._on_update_handler(vm.calls, outgoing)
+        await asyncio.sleep(0.1)
+        self.assertEqual(vm.calls.send_frame.call_count, sent_count)
 
         await vm.leave_bridge()
 
