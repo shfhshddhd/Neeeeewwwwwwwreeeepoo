@@ -173,6 +173,45 @@ class VoiceBridge:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class BridgeFrameStats:
+    """Diagnostic counters for StreamFrames and audio relay path."""
+
+    events_received: int = 0
+    events_accepted: int = 0
+    events_rejected: int = 0
+    frames_received: int = 0
+    bytes_received: int = 0
+    non_silent_frames: int = 0
+    queue_frames: int = 0
+    relayed_frames: int = 0
+    sent_frames: int = 0
+    last_stats_log: float = field(default_factory=time.monotonic)
+    last_frame_log: float = 0.0
+    last_audio_log: float = 0.0
+    last_relay_log: float = 0.0
+
+
+def _calc_pcm_telemetry(pcm_bytes: bytes) -> tuple[int, float, int, int, bool]:
+    """Calculate (total_bytes, rms, peak, nonzero_bytes, non_silent) safely."""
+    total_bytes = len(pcm_bytes)
+    if total_bytes == 0:
+        return 0, 0.0, 0, 0, False
+    nonzero = sum(1 for b in pcm_bytes if b != 0)
+    even_len = total_bytes - (total_bytes % 2)
+    if even_len >= 2:
+        samples = array("h")
+        samples.frombytes(pcm_bytes[:even_len])
+        if samples:
+            peak = max(abs(s) for s in samples)
+            sum_sq = sum(s * s for s in samples)
+            rms = math.sqrt(sum_sq / len(samples))
+            non_silent = rms > 30.0 or peak > 100
+            return total_bytes, round(rms, 2), peak, nonzero, non_silent
+    non_silent = nonzero > 0
+    return total_bytes, 0.0, 0, nonzero, non_silent
+
+
 class VoiceBridgeNoActiveGroupCall(NoActiveGroupCall, RuntimeError):
     """Exception raised when a required group voice call is not active during bridging."""
 
@@ -307,6 +346,15 @@ class VoiceChatManager:
         self._temp_dir = Path(tempfile.mkdtemp(prefix="telegram-userbot-vc-"))
         self.audio_bridge: AudioHTTPBridge = AudioHTTPBridge()
         self.pulse_sink_name: str = "vcrelay"
+        self._frame_stats: dict[int, BridgeFrameStats] = {}
+
+    def _get_frame_stats(self, chat_id: int | None) -> BridgeFrameStats:
+        key = chat_id if chat_id is not None else 0
+        stats = self._frame_stats.get(key)
+        if stats is None:
+            stats = BridgeFrameStats()
+            self._frame_stats[key] = stats
+        return stats
 
     def get_state(self, chat_id: int | None = None) -> VoiceState | None:
         if chat_id is None:
@@ -333,14 +381,117 @@ class VoiceChatManager:
                 update_chat_id = getattr(update, "chat_id", None)
                 state = self.get_state(update_chat_id)
                 chat_match = state is not None
+                direction_raw = getattr(update, "direction", None)
+                device_raw = getattr(update, "device", None)
                 direction = str(
-                    getattr(update.direction, "name", update.direction)
+                    getattr(direction_raw, "name", direction_raw)
                 ).upper()
                 device = str(
-                    getattr(update.device, "name", update.device)
+                    getattr(device_raw, "name", device_raw)
                 ).upper()
+
+                frames_list = getattr(update, "frames", []) or []
+                frame_count = len(frames_list)
+                first_frame = frames_list[0] if frames_list else None
+                frame_type = type(first_frame).__name__ if first_frame is not None else "None"
+                frame_attrs = (
+                    [attr for attr in dir(first_frame) if not attr.startswith("_")]
+                    if first_frame is not None
+                    else []
+                )
+
+                all_payloads: list[bytes] = []
+                total_bytes = 0
+                for frame in frames_list:
+                    payload = (
+                        getattr(
+                            frame,
+                            "frame",
+                            getattr(frame, "data", b""),
+                        )
+                        or b""
+                    )
+                    if isinstance(payload, bytes):
+                        all_payloads.append(payload)
+                        total_bytes += len(payload)
+
+                stats = self._get_frame_stats(update_chat_id)
+                stats.events_received += 1
+                stats.frames_received += frame_count
+                stats.bytes_received += total_bytes
+
+                now = time.monotonic()
+                # TASK 2: Log every received StreamFrames event before filtering
+                if stats.events_received <= 5 or (now - stats.last_frame_log) >= 2.5:
+                    stats.last_frame_log = now
+                    logger.info(
+                        "[VC_BRIDGE_FRAMES] received chat_id=%s direction=%s device=%s frame_count=%d bytes=%d frame_type=%s frame_attrs=%s",
+                        update_chat_id,
+                        direction,
+                        device,
+                        frame_count,
+                        total_bytes,
+                        frame_type,
+                        frame_attrs,
+                    )
+
+                # TASK 3: Log rejection vs acceptance
                 if not (direction == "INCOMING" and device == "SPEAKER"):
+                    stats.events_rejected += 1
+                    if stats.events_rejected <= 5 or (now - stats.last_frame_log) >= 2.5:
+                        logger.info(
+                            "[VC_BRIDGE_FRAMES] rejected chat_id=%s direction=%s device=%s reason=direction_or_device_filter",
+                            update_chat_id,
+                            direction,
+                            device,
+                        )
                     return
+
+                stats.events_accepted += 1
+                if stats.events_accepted <= 5 or (now - stats.last_frame_log) >= 2.5:
+                    logger.info(
+                        "[VC_BRIDGE_FRAMES] accepted chat_id=%s direction=%s device=%s frame_count=%d bytes=%d",
+                        update_chat_id,
+                        direction,
+                        device,
+                        frame_count,
+                        total_bytes,
+                    )
+
+                # TASK 4: Inspect actual PCM content
+                combined_pcm = b"".join(all_payloads)
+                pcm_bytes, rms, peak, nonzero, non_silent = _calc_pcm_telemetry(combined_pcm)
+                if non_silent:
+                    stats.non_silent_frames += frame_count
+
+                if stats.events_accepted <= 5 or (now - stats.last_audio_log) >= 2.5:
+                    stats.last_audio_log = now
+                    logger.info(
+                        "[VC_BRIDGE_FRAMES_AUDIO] chat_id=%s bytes=%d rms=%.2f peak=%d nonzero=%d non_silent=%s",
+                        update_chat_id,
+                        pcm_bytes,
+                        rms,
+                        peak,
+                        nonzero,
+                        non_silent,
+                    )
+
+                # TASK 7: Aggregate stats reporting
+                if (now - stats.last_stats_log) >= 2.5:
+                    stats.last_stats_log = now
+                    logger.info(
+                        "[VC_BRIDGE_FRAME_STATS] chat_id=%s events_received=%d events_accepted=%d events_rejected=%d frames_received=%d bytes_received=%d non_silent_frames=%d queue_frames=%d relayed_frames=%d sent_frames=%d",
+                        update_chat_id,
+                        stats.events_received,
+                        stats.events_accepted,
+                        stats.events_rejected,
+                        stats.frames_received,
+                        stats.bytes_received,
+                        stats.non_silent_frames,
+                        stats.queue_frames,
+                        stats.relayed_frames,
+                        stats.sent_frames,
+                    )
 
                 # 1. Source -> Target Audio Bridge Relay (PCM16, 48kHz, mono)
                 bridge = self.bridge
@@ -349,16 +500,9 @@ class VoiceChatManager:
                     and bridge.active
                     and bridge.source_chat_id == update_chat_id
                 ):
-                    for frame in update.frames:
-                        payload = (
-                            getattr(
-                                frame,
-                                "frame",
-                                getattr(frame, "data", b""),
-                            )
-                            or b""
-                        )
+                    for payload in all_payloads:
                         if payload:
+                            stats.queue_frames += 1
                             if bridge.queue.full():
                                 with contextlib.suppress(asyncio.QueueEmpty):
                                     bridge.queue.get_nowait()
@@ -1377,13 +1521,13 @@ class VoiceChatManager:
         """Continuously relay audio frames from source VC to target VC."""
         queue = bridge.queue
         chunk_size = _LIVE_FRAME_BYTES
+        stats = self._get_frame_stats(bridge.source_chat_id)
         try:
             while bridge.active:
                 data = await queue.get()
                 if not data or not bridge.active:
                     continue
-                if bridge.muted:
-                    continue
+                now = time.monotonic()
                 transformed = self._apply_bridge_gain(
                     data,
                     bridge.volume,
@@ -1392,26 +1536,55 @@ class VoiceChatManager:
                 )
                 if not transformed:
                     continue
+
+                if bridge.relayed_frames <= 5 or (now - stats.last_relay_log) >= 2.5:
+                    stats.last_relay_log = now
+                    logger.info(
+                        "[VC_BRIDGE_RELAY] queue_received target_chat_id=%s bytes=%d transformed_bytes=%d",
+                        bridge.target_chat_id,
+                        len(data),
+                        len(transformed),
+                    )
+
+                if bridge.muted:
+                    continue
+
                 offset = 0
                 while offset < len(transformed):
                     chunk = transformed[offset : offset + chunk_size]
+                    to_send = None
                     if len(chunk) == chunk_size:
-                        await self.calls.send_frame(
-                            bridge.target_chat_id,
-                            Device.MICROPHONE,
-                            chunk,
-                        )
-                        bridge.relayed_frames += 1
-                        bridge.relayed_bytes += len(chunk)
+                        to_send = chunk
                     elif len(chunk) > 0 and len(chunk) % 2 == 0:
-                        padded = chunk.ljust(chunk_size, b"\x00")
-                        await self.calls.send_frame(
-                            bridge.target_chat_id,
-                            Device.MICROPHONE,
-                            padded,
-                        )
-                        bridge.relayed_frames += 1
-                        bridge.relayed_bytes += len(padded)
+                        to_send = chunk.ljust(chunk_size, b"\x00")
+
+                    if to_send:
+                        try:
+                            await self.calls.send_frame(
+                                bridge.target_chat_id,
+                                Device.MICROPHONE,
+                                to_send,
+                            )
+                            bridge.relayed_frames += 1
+                            bridge.relayed_bytes += len(to_send)
+                            stats.relayed_frames += 1
+                            stats.sent_frames += 1
+                            if (
+                                bridge.relayed_frames <= 5
+                                or (time.monotonic() - stats.last_relay_log) >= 2.5
+                            ):
+                                stats.last_relay_log = time.monotonic()
+                                logger.info(
+                                    "[VC_BRIDGE_RELAY] frame_sent target_chat_id=%s bytes=%d",
+                                    bridge.target_chat_id,
+                                    len(to_send),
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "[VC_BRIDGE_RELAY] send_frame_error target_chat_id=%s error=%s",
+                                bridge.target_chat_id,
+                                exc,
+                            )
                     offset += chunk_size
 
                 bridge.last_frame_at = time.monotonic()

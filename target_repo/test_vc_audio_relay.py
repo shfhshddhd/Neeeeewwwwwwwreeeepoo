@@ -388,6 +388,42 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(bridge.pulse_watchdog_task)
             self.assertIsNone(vm.bridge)
 
+    def test_pcm_telemetry_and_diagnostics(self):
+        import math
+        from array import array
+        from plugins.voice_chat import _calc_pcm_telemetry, BridgeFrameStats
+
+        # Empty data
+        total, rms, peak, nonzero, non_silent = _calc_pcm_telemetry(b"")
+        self.assertEqual((total, rms, peak, nonzero, non_silent), (0, 0.0, 0, 0, False))
+
+        # All zeros (silent)
+        silent_data = b"\x00" * 960
+        total, rms, peak, nonzero, non_silent = _calc_pcm_telemetry(silent_data)
+        self.assertEqual(total, 960)
+        self.assertEqual(rms, 0.0)
+        self.assertEqual(peak, 0)
+        self.assertEqual(nonzero, 0)
+        self.assertFalse(non_silent)
+
+        # Sine wave or loud signal (non-silent)
+        samples = [int(1000 * math.sin(i)) for i in range(480)]
+        loud_data = array("h", samples).tobytes()
+        total, rms, peak, nonzero, non_silent = _calc_pcm_telemetry(loud_data)
+        self.assertEqual(total, 960)
+        self.assertGreater(rms, 50.0)
+        self.assertGreater(peak, 500)
+        self.assertGreater(nonzero, 0)
+        self.assertTrue(non_silent)
+
+        # BridgeFrameStats tracker
+        stats = BridgeFrameStats()
+        self.assertEqual(stats.events_received, 0)
+        stats.events_received += 1
+        stats.bytes_received += total
+        self.assertEqual(stats.events_received, 1)
+        self.assertEqual(stats.bytes_received, 960)
+
 
 if __name__ == "__main__":
     unittest.main()
