@@ -140,7 +140,7 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         await bridge.stop()
 
     async def test_voice_chat_manager_join_bridge_uses_mediastream(self):
-        """Verify join_bridge configures MediaStream with silence on source and capture on target."""
+        """Verify join_bridge configures native ExternalMedia streams on source and target."""
         client_mock = MagicMock()
         client_mock.is_connected.return_value = True
 
@@ -173,10 +173,7 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         vm.calls.unmute = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
-        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_sink, \
-             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
-             patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
-            mock_sink.return_value = "vcrelay.monitor"
+        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
             mock_peer_id.side_effect = lambda ent: -1001111 if ent == source_chat else -1002222
             res = await vm.join_bridge(source_chat_id=-1001111, target_identifier="targetgroup")
 
@@ -191,53 +188,26 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         call_1_args = vm.calls.play.call_args_list[0][0]
         call_2_args = vm.calls.play.call_args_list[1][0]
 
-        def get_stream_path(stream_obj):
-            if hasattr(stream_obj, "_media_path") and isinstance(stream_obj._media_path, str):
-                return stream_obj._media_path
-            if hasattr(stream_obj, "media_path") and isinstance(stream_obj.media_path, str):
-                return stream_obj.media_path
-            try:
-                from pytgcalls.types import MediaStream as MS
-                if hasattr(MS, "call_args_list") and MS.call_args_list:
-                    urls = [str(c[0][0]) for c in MS.call_args_list if c and c[0]]
-                    if urls:
-                        return " ".join(urls)
-            except Exception:
-                pass
-            if hasattr(stream_obj, "call_args") and stream_obj.call_args:
-                return str(stream_obj.call_args[0][0])
-            return str(stream_obj)
-
         self.assertEqual(call_1_args[0], -1001111)
-        self.assertIn("silence", get_stream_path(call_1_args[1]))
-
         self.assertEqual(call_2_args[0], -1002222)
-        self.assertIn("capture", get_stream_path(call_2_args[1]))
 
-        # Test set_level updates capture stream
-        with patch.object(vm, "_restart_bridge_capture", new_callable=AsyncMock) as mock_restart:
-            await vm.set_level(15)
-            self.assertEqual(vm.bridge.level, 15)
-            mock_restart.assert_called_once_with(vm.bridge)
+        # Test set_level updates bridge level and volume
+        await vm.set_level(15)
+        self.assertEqual(vm.bridge.level, 15)
+        self.assertEqual(vm.bridge.volume, 300)
 
-        # Test set_bass updates capture stream
-        with patch.object(vm, "_restart_bridge_capture", new_callable=AsyncMock) as mock_restart:
-            await vm.set_bass(5)
-            self.assertEqual(vm.bridge.bass, 5)
-            mock_restart.assert_called_once_with(vm.bridge)
+        # Test set_bass updates bridge bass
+        await vm.set_bass(5)
+        self.assertEqual(vm.bridge.bass, 5)
 
         # Test mute_bridge and unmute_bridge
-        with patch.object(vm, "_restart_bridge_capture", new_callable=AsyncMock) as mock_restart:
-            await vm.mute_bridge()
-            self.assertTrue(vm.bridge.muted)
-            mock_restart.assert_called_once_with(vm.bridge)
-            vm.calls.mute.assert_called_once_with(-1002222)
+        await vm.mute_bridge()
+        self.assertTrue(vm.bridge.muted)
+        vm.calls.mute.assert_called_once_with(-1002222)
 
-        with patch.object(vm, "_restart_bridge_capture", new_callable=AsyncMock) as mock_restart:
-            await vm.unmute_bridge()
-            self.assertFalse(vm.bridge.muted)
-            mock_restart.assert_called_once_with(vm.bridge)
-            vm.calls.unmute.assert_called_once_with(-1002222)
+        await vm.unmute_bridge()
+        self.assertFalse(vm.bridge.muted)
+        vm.calls.unmute.assert_called_once_with(-1002222)
 
         # Test leave_bridge
         leave_res = await vm.leave_bridge()
@@ -367,16 +337,12 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
         vm.calls.leave_call = AsyncMock()
         vm._active_group_call = AsyncMock(return_value=MagicMock())
 
-        with patch("plugins.voice_chat.ensure_pulseaudio_ready", new_callable=AsyncMock) as mock_ready, \
-             patch("plugins.voice_chat.ensure_virtual_sink", new_callable=AsyncMock), \
-             patch("plugins.voice_chat.get_peer_id") as mock_peer_id, \
-             patch("plugins.voice_chat.route_sink_inputs_to_vcrelay", new_callable=AsyncMock) as mock_route:
-            mock_ready.return_value = "vcrelay.monitor"
+        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
             mock_peer_id.side_effect = lambda ent: -100101 if ent == source_chat else -100202
             await vm.join_bridge(source_chat_id=-100101, target_identifier="targetgroup")
 
             self.assertIsNotNone(vm.bridge)
-            self.assertIsNotNone(vm.bridge.pulse_watchdog_task)
+            self.assertIsNotNone(vm.bridge.watchdog_task)
 
             # Let the watchdog run a tick
             await asyncio.sleep(0.1)
@@ -385,8 +351,71 @@ class TestVCAudioRelay(unittest.IsolatedAsyncioTestCase):
             await vm._stop_bridge(bridge, leave_target=True)
 
             self.assertFalse(bridge.active)
-            self.assertIsNone(bridge.pulse_watchdog_task)
+            self.assertIsNone(bridge.watchdog_task)
             self.assertIsNone(vm.bridge)
+
+    async def test_native_stream_frames_relay(self):
+        """Test StreamFrames reception from source VC and relay to target VC."""
+        client_mock = MagicMock()
+        client_mock.is_connected.return_value = True
+
+        from telethon.tl import types as tl_types
+        source_chat = MagicMock(spec=tl_types.Chat)
+        source_chat.id = 101
+        source_chat.title = "Source VC"
+
+        target_chat = MagicMock(spec=tl_types.Channel)
+        target_chat.id = 202
+        target_chat.megagroup = True
+        target_chat.title = "Target VC"
+
+        def get_entity_side_effect(ident):
+            if ident in (101, -100101):
+                return source_chat
+            if ident in (202, -100202, "targetgroup"):
+                return target_chat
+            raise ValueError(f"Unknown entity: {ident}")
+
+        client_mock.get_entity = AsyncMock(side_effect=get_entity_side_effect)
+
+        with patch("plugins.voice_chat.PyTgCalls"):
+            vm = VoiceChatManager(client_mock)
+
+        vm.calls.start = AsyncMock()
+        vm.calls.play = AsyncMock()
+        vm.calls.leave_call = AsyncMock()
+        vm.calls.send_frame = AsyncMock()
+        vm._active_group_call = AsyncMock(return_value=MagicMock())
+
+        with patch("plugins.voice_chat.get_peer_id") as mock_peer_id:
+            mock_peer_id.side_effect = lambda ent: -100101 if ent == source_chat else -100202
+            await vm.join_bridge(source_chat_id=-100101, target_identifier="targetgroup")
+
+        # Simulate incoming StreamFrames update from source VC
+        from pytgcalls.types import StreamFrames, Device
+
+        mock_frame = MagicMock()
+        mock_frame.frame = b"\x10\x20" * 480  # 960 bytes of non-zero audio
+
+        update = MagicMock(spec=StreamFrames)
+        update.chat_id = -100101
+        update.direction = "INCOMING"
+        update.device = "SPEAKER"
+        update.frames = [mock_frame]
+
+        # Call on_update
+        await vm._on_update_handler(vm.calls, update)
+
+        # Let relay loop process frame
+        await asyncio.sleep(0.1)
+
+        # Verify frame sent to target VC
+        vm.calls.send_frame.assert_called()
+        send_args = vm.calls.send_frame.call_args[0]
+        self.assertEqual(send_args[0], -100202)  # target_chat_id
+        self.assertEqual(len(send_args[2]), 960)  # 960 bytes frame
+
+        await vm.leave_bridge()
 
     def test_pcm_telemetry_and_diagnostics(self):
         import math
